@@ -5,6 +5,7 @@ import json
 import os
 import stat
 import shutil
+from base64 import b64encode
 from argparse import Namespace
 from importlib.metadata import PackageNotFoundError, distribution
 from pathlib import Path
@@ -43,6 +44,28 @@ def doctor(args: Namespace) -> int:
     checks.append(("credentials.json", str(credential_path) if credential_path.is_file()
                    and credential_path.stat().st_size else None))
 
+    if getattr(args, "doctor_session", False):
+        session_status = None
+        session_error_type = None
+        if credential_path.is_file() and credential_path.stat().st_size:
+            try:
+                from librespot.core import Session
+                credentials = json.loads(credential_path.read_text(encoding="utf-8"))
+                builder = Session.Builder()
+                builder.conf.store_credentials = False
+                encoded = b64encode(json.dumps(credentials, ensure_ascii=True).encode("ascii"))
+                session = builder.stored(encoded).create()
+                session_status = "created successfully from saved credentials"
+                try:
+                    session.close()
+                except Exception:
+                    pass
+            except Exception as error:
+                # Error strings may contain provider details; keep diagnostics
+                # useful without printing credentials or authentication tokens.
+                session_error_type = type(error).__name__
+        checks.append(("Spotify session", session_status))
+
     root_value = getattr(args, "root_path", None) or config.get(ROOT_PATH, "~/Music/Zotify Music")
     root_path = Path(root_value).expanduser()
     writable_path = root_path
@@ -76,5 +99,8 @@ def doctor(args: Namespace) -> int:
 
     for name, value in checks:
         print(f"{'OK' if value else 'MISSING'}: {name}" + (f" — {value}" if value else ""))
-    print("Session login was not attempted; this check does not validate Spotify credentials online.")
+    if getattr(args, "doctor_session", False) and session_error_type:
+        print(f"DETAIL: Spotify session check failed ({session_error_type})")
+    if not getattr(args, "doctor_session", False):
+        print("Session login was not attempted; use --doctor-session to validate saved credentials online.")
     return 0 if all(value for _, value in checks) else 1

@@ -41,6 +41,9 @@ def main():
     parser.add_argument('--doctor',
                         action='store_true',
                         help='Check local Zotify prerequisites without logging in')
+    parser.add_argument('--doctor-session',
+                        action='store_true',
+                        help='With --doctor, verify that saved credentials can create a Spotify session')
     parser.add_argument('-P', '--persist',
                         action='store_true',
                         dest='persist',
@@ -139,6 +142,8 @@ def main():
     if args.doctor:
         from zotify.doctor import doctor
         return doctor(args)
+    if args.doctor_session:
+        parser.error('--doctor-session requires --doctor')
     Zotify.boot(args)
     
     from zotify.app import client

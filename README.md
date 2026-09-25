@@ -74,7 +74,7 @@ If an artist's URL is given, all albums by the specified artist will be download
 | Command Line Config Flag (no value) | Function                                                                                                           |
 |-------------------------------------|--------------------------------------------------------------------------------------------------------------------|
 | `-h`, `--help`                      | See this message                                                                                                   |
-| `--doctor`                           | Check local prerequisites, saved credentials, output permissions, and the pinned librespot dependency without logging in |
+| `--doctor`                           | Check local prerequisites, saved credentials, output permissions, and the pinned librespot dependency without logging in; add `--doctor-session` to opt in to an online session check |
 | `-V`, `--version`                   | Show the version of Zotify                                                                                         |
 | `-P`, `--persist`                   | Perform multiple Queries on the same Session, requiring only one account login                                     |
 | `-T`, `--test`, `--dry-run`         | Show the download plan without downloading audio or fetching optional genre/album enrichment                       |
