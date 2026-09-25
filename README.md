@@ -74,7 +74,8 @@ If an artist's URL is given, all albums by the specified artist will be download
 | Command Line Config Flag (no value) | Function                                                                                                           |
 |-------------------------------------|--------------------------------------------------------------------------------------------------------------------|
 | `-h`, `--help`                      | See this message                                                                                                   |
-| `--doctor`                           | Check local prerequisites, saved credentials, output permissions, and the pinned librespot dependency without logging in; add `--doctor-session` to opt in to an online session check |
+| `--doctor`                           | Check local prerequisites, readable credentials, effective output write access, and the installed librespot revision without logging in |
+| `--doctor-session`                   | With `--doctor`, opt in to validating saved credentials online; no interactive login or credential output |
 | `-V`, `--version`                   | Show the version of Zotify                                                                                         |
 | `-P`, `--persist`                   | Perform multiple Queries on the same Session, requiring only one account login                                     |
 | `-T`, `--test`, `--dry-run`         | Show the download plan without downloading audio or fetching optional genre/album enrichment                       |
@@ -97,6 +98,14 @@ If an artist's URL is given, all albums by the specified artist will be download
 | `-l`, `--liked`                     | Download all Liked Songs on your account                                                                           |
 | `-f`, `--file`                      | Download all tracks/albums/episodes/playlists URLs within the file passed as argument                              |
 | `-v`, `--verify-library`            | Update metadata for all Tracks in `ROOT_PATH` with an entry in the global `.song_archive` or directory `.song_ids` |
+
+### Run summaries and recovery
+
+After a download query, Zotify reports downloaded, skipped, tag-pending, untagged, and failed items. It returns `0` when the run completes, `1` for a partial or interrupted run, and `2` for a fatal login or query error. A dry run (`--dry-run`) prints the download plan and does not fetch optional genre or album enrichment.
+
+Failed and tag-pending track URIs are written to `zotify-failed-<run-id>.txt` under `ROOT_PATH`. Retry them with `zotify --file "/path/to/zotify-failed-<run-id>.txt"`. Existing completed files are skipped by default. Tracks with pending tags retry metadata only, without downloading their audio again; if tag retries are exhausted, Zotify keeps the audio and reports it as untagged.
+
+Each query also writes `zotify-run-<run-id>.jsonl` under `ROOT_PATH` with stage timings, retry reasons, session generations, and final track states. Full diagnostic tracebacks remain in `zotify_<run-id>.log` (or `zotify_DEBUG_<run-id>.log` with `--debug`) in the same directory. The JSONL events do not include authentication tokens or signed stream URLs.
 
 <details><summary>
 
