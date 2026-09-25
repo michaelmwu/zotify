@@ -3,6 +3,7 @@ import logging
 import re
 import sys
 import requests
+import webbrowser
 from errno import EBADF, ECONNRESET, ENOTCONN, EPIPE, ETIMEDOUT
 from binascii import hexlify
 from base64 import b64encode, b64decode
@@ -740,7 +741,12 @@ class LoginHandler:
     def create_oauth(client_id: str) -> OAuth:
         redirect_url = f"http://{Zotify.CONFIG.get_oauth_address()}:{Zotify.CONFIG.get_oauth_port()}/login"
         def oauth_print(url):
-            Printer.new_print(PrintChannel.MANDATORY, f"Click on the following link to login:\n{url}")
+            Printer.new_print(PrintChannel.MANDATORY,
+                              f"Opening the login page in your browser. If it doesn't open, open this link manually:\n{url}")
+            try:
+                webbrowser.open(url)
+            except Exception:
+                pass
         
         timeout = Zotify.CONFIG.get_oauth_timeout()
         return OAuth(client_id, redirect_url, oauth_print).set_scopes(SCOPES).set_listen_all(True).set_timeout(timeout)
@@ -1218,11 +1224,11 @@ class Zotify:
                 Printer.hashtaged(PrintChannel.ERROR, 'FAILED TO FETCH AUDIO KEY\n' +
                                                   'MAY BE CAUSED BY RATE LIMITS - CONSIDER INCREASING `BULK_WAIT_TIME`\n' +
                                                  f'GID: {gid[5:]} - File_ID: {fileid[8:]}')
-                Printer.logger("\n".join(e.args), PrintChannel.ERROR)
+                Printer.logger("\n".join(str(arg) for arg in e.args), PrintChannel.ERROR)
             elif isinstance(error_arg, int):
                 Printer.hashtaged(PrintChannel.ERROR, 'FAILED TO FETCH AUDIO KEY\n' +
                                                      f'(ASSUMED HTTP) RUNTIME ERROR - STATUS CODE {error_arg}')
-                Printer.logger("\n".join(e.args), PrintChannel.ERROR)
+                Printer.logger("\n".join(str(arg) for arg in e.args), PrintChannel.ERROR)
             else: raise
         except ConnectionError as e:
             if isinstance(e, OSError) and e.errno in {EBADF, ECONNRESET, ENOTCONN, EPIPE, ETIMEDOUT}:
@@ -1231,7 +1237,7 @@ class Zotify:
             status_code = e.args[0].split("Status code ")[1]
             Printer.hashtaged(PrintChannel.ERROR, 'FAILED TO FETCH AUDIO FILE\n' +
                                                  f'CONNECTION ERROR WHEN FETCHING CONTENT STREAM - STATUS CODE {status_code}')
-            Printer.logger("\n".join(e.args), PrintChannel.ERROR)
+            Printer.logger("\n".join(str(arg) for arg in e.args), PrintChannel.ERROR)
         except Exception as e:
             if isinstance(e, OSError) and e.errno in {EBADF, ECONNRESET, ENOTCONN, EPIPE, ETIMEDOUT}:
                 return cls.retry_after_session_loss(content, use_qual_pref, recover_session, e)
