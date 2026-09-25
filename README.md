@@ -75,6 +75,8 @@ If an artist's URL is given, all albums by the specified artist will be download
 |-------------------------------------|--------------------------------------------------------------------------------------------------------------------|
 | `-h`, `--help`                      | See this message                                                                                                   |
 | `-V`, `--version`                   | Show the version of Zotify                                                                                         |
+| `--doctor`                          | Check FFmpeg, credentials, output write access, and the installed librespot revision without logging in             |
+| `--doctor-session`                  | With `--doctor`, opt in to creating and closing a session from saved credentials (requires network access)          |
 | `-P`, `--persist`                   | Perform multiple Queries on the same Session, requiring only one account login                                     |
 | `-T`, `--test`, `--dry-run`         | Perform a "dry run" of a Query, fetching metadata without downloading/modifying any music files                    |
 | `--update-config`                   | Updates the `config.json` file while keeping all current settings unchanged                                        |
@@ -96,6 +98,8 @@ If an artist's URL is given, all albums by the specified artist will be download
 | `-l`, `--liked`                     | Download all Liked Songs on your account                                                                           |
 | `-f`, `--file`                      | Download all tracks/albums/episodes/playlists URLs within the file passed as argument                              |
 | `-v`, `--verify-library`            | Update metadata for all Tracks in `ROOT_PATH` with an entry in the global `.song_archive` or directory `.song_ids` |
+
+Run `zotify --doctor` for local checks. To verify that the saved credentials can create a Spotify session, run `zotify --doctor --doctor-session`; this contacts Spotify, does not start an interactive login, and never prints credentials or tokens.
 
 <details><summary>
 
