@@ -521,6 +521,7 @@ class Interface:
         Interface.LAST_DL_ITEM_NAME = dlcontent.name
         
         dlcontent.set_dl_status("Waiting Between Downloads")
-        Printer.hashtaged(PrintChannel.DOWNLOADS, f'DOWNLOADED: "{dlcontent.rel_path(path)}"\n' +
-                                                  f'DOWNLOAD TOOK {time_elapsed_dl}' +
-                                                  f' (PLUS {time_elapsed_ffmpeg} CONVERTING)' if time_elapsed_ffmpeg else '')
+        message = f'DOWNLOADED: "{dlcontent.rel_path(path)}"\nDOWNLOAD TOOK {time_elapsed_dl}'
+        if time_elapsed_ffmpeg:
+            message += f' (PLUS {time_elapsed_ffmpeg} CONVERTING)'
+        Printer.hashtaged(PrintChannel.DOWNLOADS, message)
