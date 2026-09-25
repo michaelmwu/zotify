@@ -2,9 +2,8 @@
 from __future__ import annotations
 
 import json
-import os
-import stat
 import shutil
+import tempfile
 from base64 import b64encode
 from argparse import Namespace
 from importlib.metadata import PackageNotFoundError, distribution
@@ -41,19 +40,25 @@ def doctor(args: Namespace) -> int:
         credential_path = Config._default_path()
     if credential_path.suffix.lower() != ".json":
         credential_path = credential_path / "credentials.json"
-    checks.append(("credentials.json", str(credential_path) if credential_path.is_file()
-                   and credential_path.stat().st_size else None))
+    saved_credentials = None
+    try:
+        if credential_path.is_file() and credential_path.stat().st_size:
+            parsed_credentials = json.loads(credential_path.read_text(encoding="utf-8"))
+            if isinstance(parsed_credentials, dict) and isinstance(parsed_credentials.get("type"), str):
+                saved_credentials = parsed_credentials
+    except (OSError, json.JSONDecodeError):
+        pass
+    checks.append(("readable credentials.json", str(credential_path) if saved_credentials else None))
 
     if getattr(args, "doctor_session", False):
         session_status = None
         session_error_type = None
-        if credential_path.is_file() and credential_path.stat().st_size:
+        if saved_credentials:
             try:
                 from librespot.core import Session
-                credentials = json.loads(credential_path.read_text(encoding="utf-8"))
                 builder = Session.Builder()
                 builder.conf.store_credentials = False
-                encoded = b64encode(json.dumps(credentials, ensure_ascii=True).encode("ascii"))
+                encoded = b64encode(json.dumps(saved_credentials, ensure_ascii=True).encode("ascii"))
                 session = builder.stored(encoded).create()
                 session_status = "created successfully from saved credentials"
                 try:
@@ -72,17 +77,14 @@ def doctor(args: Namespace) -> int:
     while not writable_path.exists() and writable_path != writable_path.parent:
         writable_path = writable_path.parent
     try:
-        info = writable_path.stat()
-        mode = info.st_mode
-        groups = set(os.getgroups()) | {os.getegid()}
-        if info.st_uid == os.geteuid():
-            has_write_permission = bool(mode & stat.S_IWUSR)
-        elif info.st_gid in groups:
-            has_write_permission = bool(mode & stat.S_IWGRP)
-        else:
-            has_write_permission = bool(mode & stat.S_IWOTH)
+        # Probe effective permissions rather than guessing from mode bits;
+        # ACLs and platform-specific permissions can differ from those bits.
+        with tempfile.NamedTemporaryFile(prefix=".zotify-doctor-", dir=writable_path):
+            pass
     except OSError:
         has_write_permission = False
+    else:
+        has_write_permission = True
     checks.append((f"writable output directory ({root_path})",
                    str(writable_path) if has_write_permission else None))
 
@@ -92,10 +94,11 @@ def doctor(args: Namespace) -> int:
         vcs = direct_url.get("vcs_info", {})
         commit = vcs.get("commit_id")
         source = direct_url.get("url", "")
-        dependency = f"{librespot.version} from {source}@{commit}" if commit else None
-    except (PackageNotFoundError, json.JSONDecodeError, OSError):
+        dependency = (f"{librespot.version} from {source}@{commit}"
+                      if commit and source else librespot.version)
+    except PackageNotFoundError:
         dependency = None
-    checks.append(("pinned librespot dependency", dependency))
+    checks.append(("librespot installation/revision", dependency))
 
     for name, value in checks:
         print(f"{'OK' if value else 'MISSING'}: {name}" + (f" — {value}" if value else ""))
