@@ -345,6 +345,8 @@ class Config:
         preset = str(cls.get(DOWNLOAD_PACE)).lower()
         if preset in {"safe", "normal", "fast"}:
             return {"safe": 0.75, "normal": 0.0, "fast": 0.0}[preset]
+        if preset != "custom":
+            raise ValueError(f'Unknown download pace "{preset}". Choose safe, normal, fast, or custom.')
         return cls.get(DOWNLOAD_RATE_LIMITER)
     
     @classmethod
@@ -352,6 +354,8 @@ class Config:
         preset = str(cls.get(DOWNLOAD_PACE)).lower()
         if preset in {"safe", "normal", "fast"}:
             return {"safe": 30.0, "normal": 1.0, "fast": 0.0}[preset]
+        if preset != "custom":
+            raise ValueError(f'Unknown download pace "{preset}". Choose safe, normal, fast, or custom.')
         return cls.get(BULK_WAIT_TIME)
     
     @classmethod

@@ -74,9 +74,10 @@ If an artist's URL is given, all albums by the specified artist will be download
 | Command Line Config Flag (no value) | Function                                                                                                           |
 |-------------------------------------|--------------------------------------------------------------------------------------------------------------------|
 | `-h`, `--help`                      | See this message                                                                                                   |
+| `--doctor`                           | Check local prerequisites, saved credentials, output permissions, and the pinned librespot dependency without logging in |
 | `-V`, `--version`                   | Show the version of Zotify                                                                                         |
 | `-P`, `--persist`                   | Perform multiple Queries on the same Session, requiring only one account login                                     |
-| `-T`, `--test`, `--dry-run`         | Perform a "dry run" of a Query, fetching metadata without downloading/modifying any music files                    |
+| `-T`, `--test`, `--dry-run`         | Show the download plan without downloading audio or fetching optional genre/album enrichment                       |
 | `--update-config`                   | Updates the `config.json` file while keeping all current settings unchanged                                        |
 | `--update-archive`                  | Updates the global `.song_archive` file with full filepaths, keeping non-findable entries unchanged                |
 | `--debug`                           | Enable debug mode, printing extra information and creating a `config_DEBUG.json` file                              |
@@ -128,6 +129,7 @@ Set arguments in the commandline like this: `-ie False` or `--codec mp3`. Wrap c
 | `OPTIMIZED_DOWNLOADING`      | `--optimized-downloading`           | Whether to sort download order by item duration to reduce API ratelimiting               | True          |
 | `DOWNLOAD_RATE_LIMITER`      | `-dlr`, `--download-rate-limiter`   | Slowdown multiplier based on the item's REAL_TIME_PLAY duration, 0 meaning disabled      | 0.0           |
 | `BULK_WAIT_TIME`             | `--bulk-wait-time`                  | Wait time between track downloads, in seconds                                            | 1.0           |
+| `DOWNLOAD_PACE`               | `--pace`                            | Preset pacing: `safe` (0.75 slowdown, 30s wait), `normal` (no slowdown, 1s wait), `fast` (no wait), or `custom` to use the numeric settings above | custom |
 | `TEMP_DOWNLOAD_DIR`          | `-td`, `--temp-download-dir`        | Directory where tracks are temporarily downloaded first, `""` meaning disabled           | `""`          |
 
 | Album/Artist Options         | Command Line Config Flag            | Description                                                                              | Default Value |

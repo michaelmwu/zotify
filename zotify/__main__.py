@@ -38,6 +38,9 @@ def main():
                         action='version',
                         version=f'Zotify {Zotify.VERSION}',
                         help='Show the version of Zotify')
+    parser.add_argument('--doctor',
+                        action='store_true',
+                        help='Check local Zotify prerequisites without logging in')
     parser.add_argument('-P', '--persist',
                         action='store_true',
                         dest='persist',
@@ -133,6 +136,9 @@ def main():
                             )
     
     args = parser.parse_args()
+    if args.doctor:
+        from zotify.doctor import doctor
+        return doctor(args)
     Zotify.boot(args)
     
     from zotify.app import client
