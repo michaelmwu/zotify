@@ -5,6 +5,7 @@ import sys
 import threading
 import requests
 import webbrowser
+from contextvars import ContextVar
 from errno import EBADF, ECONNRESET, ENOTCONN, EPIPE, ETIMEDOUT
 from binascii import hexlify
 from base64 import b64encode, b64decode
@@ -877,11 +878,24 @@ class Zotify:
     TOTAL_API_CALLS         : int                       = None
     DATETIME_LAUNCH         : str                       = None
     RUN_EXIT_CODE           : int                       = 0
-    RUN_CONTEXT                                         = None
+    _RUN_CONTEXT = ContextVar("zotify_run_context", default=None)
+
+    @classmethod
+    def current_context(cls):
+        return cls._RUN_CONTEXT.get()
+
+    @classmethod
+    @contextmanager
+    def bind_run_context(cls, context):
+        token = cls._RUN_CONTEXT.set(context)
+        try:
+            yield
+        finally:
+            cls._RUN_CONTEXT.reset(token)
 
     @classmethod
     def current_session(cls):
-        context = cls.RUN_CONTEXT
+        context = cls.current_context()
         return context.session if context is not None else cls.SESSION
     
     @classmethod
@@ -916,7 +930,7 @@ class Zotify:
     @classmethod
     def boot(cls, args) -> None:
         cls.RUN_EXIT_CODE = 0
-        cls.RUN_CONTEXT = None
+        cls._RUN_CONTEXT.set(None)
         Printer.splash()
         cls.start_stats()
         cls.CONFIG.load(args)
@@ -1243,8 +1257,9 @@ class Zotify:
         new_session = builder.stored(encoded).create()
         new_credentials = new_session.credentials()
         cls.SESSION = new_session
-        if cls.RUN_CONTEXT is not None:
-            cls.RUN_CONTEXT.replace_session(new_session)
+        context = cls.current_context()
+        if context is not None:
+            context.replace_session(new_session)
         cls.SESSION_CREDENTIALS = new_credentials
         LoginHandler.SESSION = new_session
         cls.FORCE_STREAM_API_CALLS = False
@@ -1263,9 +1278,10 @@ class Zotify:
         try:
             cls.renew_session()
         except Exception as reconnect_error:
-            if cls.RUN_CONTEXT is not None:
-                cls.RUN_CONTEXT.record("session_renewal_failed",
-                                       error_type=type(reconnect_error).__name__)
+            context = cls.current_context()
+            if context is not None:
+                context.record("session_renewal_failed",
+                               error_type=type(reconnect_error).__name__)
             raise RuntimeError("Could not restore Spotify session; rerun Zotify to resume") from reconnect_error
         return None
 

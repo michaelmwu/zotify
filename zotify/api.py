@@ -7,9 +7,19 @@ import shutil
 from time import time, sleep
 from time import monotonic
 from uuid import uuid4
+from functools import wraps
 
 from zotify.config import Zotify, Streamer
 from zotify.utils import *
+
+
+def query_contextual(method):
+    """Bind per-query session and journal state for the full execution scope."""
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with Zotify.bind_run_context(self.context):
+            return method(self, *args, **kwargs)
+    return wrapped
 
 
 class DynamicClassNameAttrs(type):
@@ -1471,7 +1481,6 @@ class Query(Container):
         self.context = RunContext(self.id, Zotify.SESSION,
                                   DownloadJournal(Zotify.CONFIG.get_root_path()),
                                   Zotify.CONFIG.get_root_path())
-        Zotify.RUN_CONTEXT = self.context
 
     def record_run_event(self, event: str, **fields) -> None:
         self.context.record(event, **fields)
@@ -1754,6 +1763,7 @@ class Query(Container):
                               untagged=len(untagged), failed=len(failed),
                               exit_code=Zotify.RUN_EXIT_CODE)
     
+    @query_contextual
     def execute(self):
         run_started = monotonic()
         self.record_run_event("run_started")
@@ -1850,6 +1860,7 @@ class VerifyLibrary(Query):
         for archive in all_archives:
             archive.update(self, TRACK)
     
+    @query_contextual
     def execute(self) -> None:
         # no zmd prefetch, meant to update entries
         all_archives, paths_per_track, track_resps = self.fetch_verifiable_metadata()
@@ -1885,6 +1896,7 @@ class UserItem(Query):
             selected_item_resps = user_item_resps[1:]
         return selected_item_resps
     
+    @query_contextual
     def execute(self):
         user_item_resps = self.fetch_user_items()
         if not user_item_resps: return
