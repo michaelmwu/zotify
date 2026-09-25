@@ -1,4 +1,6 @@
 import json
+import os
+import tempfile
 from base64 import b64encode, b64decode
 from music_tag import AudioFile, load_file
 from music_tag.file import TAG_MAP_ENTRY, MetadataItem
@@ -6,6 +8,7 @@ from music_tag.mp4 import freeform_set
 from mutagen.id3 import TXXX
 
 from zotify.api import *
+from zotify.utils import fetch_artwork
 
 
 class MetadataIO:
@@ -23,7 +26,9 @@ class MetadataIO:
             setattr(self, attr, safe_typecast(resp, attr, bool))
         self.external_urls          : dict              = resp.get(EXTERNAL_URLS)
         self.gid                    : bytes             = resp.get(GID)
-        self.genres                 : list[str]         = resp.get(GENRES)
+        # librespot's protobuf uses the singular field name, while Spotify's
+        # Web API uses the plural form. Normalize both at the parser boundary.
+        self.genres                 : list[str]         = resp.get(GENRES) if GENRES in resp else resp.get(GENRE)
         # self.lyrics               : list[str]         = resp.get(LYRICS)
         
         def ensure_uri(item: dict | None, type_attr_and_ind: str):
@@ -308,12 +313,15 @@ class MetadataIO:
         
         derefed = {}
         for k, v in obj.items():
-            if k[0] == "_" or k in cls.SKIP_ATTRS or not v:         continue
-            elif k == ID and v == obj.get(URI, "").split(":")[-1]:  continue
-            elif k in cls.SET_ATTRS:                                derefed[k] = [cls._deref(n) for n in v]
-            elif isinstance(v, bytes):                              derefed[k] = cls.BYTES_HEADER + b64encode(v).decode('ascii')
-            elif isinstance(v, (Content, list, dict)):              derefed[k] = cls._deref(v)
-            else:                                                   derefed[k] = v
+            if isinstance(k, str):
+                if k.startswith("_") or k in cls.SKIP_ATTRS: continue
+                if k == ID and v == obj.get(URI, "").split(":")[-1]: continue
+                if not v and not (k == GENRES and v == []): continue
+            key = cls._to_link(k) if isinstance(k, Content) else str(k)
+            if isinstance(k, str) and k in cls.SET_ATTRS:           derefed[key] = [cls._deref(n) for n in v]
+            elif isinstance(v, bytes):                              derefed[key] = cls.BYTES_HEADER + b64encode(v).decode('ascii')
+            elif isinstance(v, (Content, list, dict)):              derefed[key] = cls._deref(v)
+            else:                                                   derefed[key] = v
         return derefed
     
     @classmethod
@@ -326,9 +334,10 @@ class MetadataIO:
         
         rerefed = {}
         for k, v in obj.items():
-            if k in cls.SET_ATTRS:                  rerefed[k] = set(cls._reref(v, dests))
-            if isinstance(v, (str, list, dict)):    rerefed[k] = cls._reref(v, dests)
-            else:                                   rerefed[k] = v
+            key = dests.get(k, k)
+            if k in cls.SET_ATTRS:                  rerefed[key] = set(cls._reref(v, dests))
+            elif isinstance(v, (str, list, dict)):  rerefed[key] = cls._reref(v, dests)
+            else:                                   rerefed[key] = v
         return rerefed
     
     @classmethod
@@ -349,8 +358,17 @@ class MetadataIO:
             if obj_link not in dests: continue
             obj = dests[obj_link]
             for k, v in cls._reref(md, dests).items():
-                setattr(obj, k, v)
-            obj._hasMetadata = obj.full_metadata()
+                current = getattr(obj, k, None)
+                if isinstance(obj, Container) and current is obj._main_items and isinstance(v, list):
+                    obj._main_items[:] = v
+                else:
+                    setattr(obj, k, v)
+            if isinstance(obj, Playlist) and (obj.length is None or len(obj._main_items) < obj.length):
+                # A partial playlist must be fetched again rather than silently omitting tracks.
+                obj._main_items.clear()
+                obj._hasMetadata = False
+            else:
+                obj._hasMetadata = obj.full_metadata()
         cls.PARSING = None
     
     @classmethod
@@ -389,8 +407,19 @@ class MetadataIO:
         zmd[ZMD_ENTRIES].update(entries)
         cls.PARSING = None
         
-        with open(zmd_path, "w") as f:
-            json.dump(zmd, f, indent=4)
+        fd, temp_name = tempfile.mkstemp(prefix=f".{zmd_path.name}.", suffix=".tmp",
+                                         dir=zmd_path.parent)
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(zmd, f, indent=4)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temp_name, zmd_path)
+        finally:
+            try:
+                os.unlink(temp_name)
+            except FileNotFoundError:
+                pass
 
 
 class Tagger:
@@ -431,7 +460,7 @@ class Tagger:
                 ALBUMARTIST:    obj.artist_names(),
                 COMPILATION:    obj.compilation,
                 YEAR:           obj.year,
-                ARTWORK:        requests.get(obj.image_url).content if obj.image_url else None, # expect jpeg
+                ARTWORK:        fetch_artwork(obj.image_url),
             }
             optional_tags = {
                 TOTALTRACKS:    obj.total_tracks if Zotify.CONFIG.get_disc_track_totals() else None,
@@ -559,6 +588,9 @@ class SongArchive:
         self.path = Zotify.CONFIG.get_song_archive_location() if dir_path is None else dir_path / '.song_ids'
         self.mode = 'a' if file_has_content(self.path) else 'w' # should always exist from Content.create_download_directory()
         self.disabled = Zotify.CONFIG.get_no_song_archive() if self._global else Zotify.CONFIG.get_no_dir_archives()
+        self._entries: list[dict[str, str | PurePath]] | None = None
+        self._lookup_index: tuple[dict[str, list[tuple[int, dict[str, str | PurePath]]]],
+                                  dict[str, list[tuple[int, dict[str, str | PurePath]]]]] | None = None
     
     def _obj_to_entry(self, obj: DLContent, item_path: PurePath, timestamp: str = None) -> dict[str, str | PurePath]:
         entry = self.ARCHIVE_FORMAT.copy()
@@ -581,6 +613,9 @@ class SongArchive:
     def add_obj(self, obj: DLContent, item_path: PurePath) -> None:
         if self.disabled: return
         self._add_entries(self.mode, [self._obj_to_entry(obj, item_path)])
+        self.mode = 'a'
+        self._entries = None
+        self._lookup_index = None
     
     def update(self, query: Query, item_prefix: str) -> None:
         entries = [self._parse_entry_str(entry_str) for entry_str in self._read_entry_strs()]
@@ -589,6 +624,8 @@ class SongArchive:
             if not obj: continue
             entry.update(self._obj_to_entry(obj, entry[self.ITEM_PATH], entry[self.DL_TIMESTAMP]))
         self._add_entries('w', entries)
+        self._entries = None
+        self._lookup_index = None
     
     def _parse_entry_str(self, entry_str: str) -> dict[str, str | PurePath]:
         entry = self.ARCHIVE_FORMAT.copy()
@@ -629,6 +666,37 @@ class SongArchive:
             self._upgrade_legacy_archive([self._parse_entry_str(entry_str) for entry_str in entries])
             entries = self._read_entry_strs()
         return entries
+
+    def _get_entries(self) -> list[dict[str, str | PurePath]]:
+        """Read and parse this archive once for repeated lookups."""
+        if self._entries is None:
+            self._entries = [self._parse_entry_str(entry_str) for entry_str in self._read_entry_strs()]
+        return self._entries
+
+    def _get_lookup_index(self):
+        if self._lookup_index is None:
+            ids: dict[str, list[tuple[int, dict[str, str | PurePath]]]] = {}
+            isrcs: dict[str, list[tuple[int, dict[str, str | PurePath]]]] = {}
+            for index, entry in enumerate(self._get_entries()):
+                ids.setdefault(str(entry[self.ITEM_ID]), []).append((index, entry))
+                if entry[self.ISRC_CODE]:
+                    isrcs.setdefault(str(entry[self.ISRC_CODE]), []).append((index, entry))
+            self._lookup_index = ids, isrcs
+        return self._lookup_index
+
+    def _entry_path(self, entry: dict[str, str | PurePath]) -> PurePath | None:
+        path = entry[self.ITEM_PATH]
+        if not path:
+            return None
+        path = PurePath(path)
+        if not path.is_absolute():
+            base = self.path.parent if not self._global else PurePath(Zotify.CONFIG.get_root_path())
+            path = base / path
+        # An archive record alone does not prove that a download completed.
+        try:
+            return path if Path(path).is_file() and Path(path).stat().st_size > 0 else None
+        except OSError:
+            return None
     
     def _get_all_of_type(self, archive_key: str) -> list[str]:
         archive_key_index = list(self.ARCHIVE_FORMAT.keys()).index(archive_key)
@@ -643,14 +711,17 @@ class SongArchive:
         return [PurePath(p) if p else None for p in path_strs]
     
     def obj_in_archive(self, obj: DLContent) -> PurePath | None:
-        index = None
-        if obj.id in self.ids():
-            index = self.ids().index(obj.id);       log_str = f"ID: {obj.id}"
-        elif Zotify.CONFIG.get_skip_by_isrc() and isinstance(obj, Track) and obj.isrc and obj.isrc in self.isrcs():
-            index = self.isrcs().index(obj.isrc);   log_str = f"ISRC: {obj.isrc}"
-        if index is None: return None
-        Printer.logger(f'Found {obj.clsn} {log_str} in archive ("{self.path}") at line {index}')
-        return self.paths()[index]
+        id_index, isrc_index = self._get_lookup_index()
+        matches = [(id_index.get(str(obj.id), []), f"ID: {obj.id}")]
+        if Zotify.CONFIG.get_skip_by_isrc() and isinstance(obj, Track) and obj.isrc:
+            matches.append((isrc_index.get(str(obj.isrc), []), f"ISRC: {obj.isrc}"))
+        for entries, log_str in matches:
+            for index, entry in entries:
+                path = self._entry_path(entry)
+                if path is not None:
+                    Printer.logger(f'Found {obj.clsn} {log_str} in archive ("{self.path}") at line {index}')
+                    return path
+        return None
 
 
 class M3U8:

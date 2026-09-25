@@ -2,11 +2,25 @@ from __future__ import annotations
 import ffmpy
 import requests
 import subprocess
+import os
+import shutil
 from time import time, sleep
+from time import monotonic
 from uuid import uuid4
+from functools import wraps
 
 from zotify.config import Zotify, Streamer
 from zotify.utils import *
+from zotify.stream_utils import expected_stream_size
+
+
+def query_contextual(method):
+    """Bind per-query session and journal state for the full execution scope."""
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with Zotify.bind_run_context(self.context):
+            return method(self, *args, **kwargs)
+    return wrapped
 
 
 class DynamicClassNameAttrs(type):
@@ -124,22 +138,35 @@ class Content(HierarchicalNode):
         return try_rel_path(p, cls._path_root)
     
     @classmethod
+    def _normalize_libre_metadata(cls, uri: str, resp: dict) -> dict:
+        """Normalize librespot responses to the shape expected by the content parser."""
+        if not resp:
+            return {}
+        resp = resp.copy()
+        if cls is Track and resp.get(DURATION):
+            resp[DURATION_MS] = resp.pop(DURATION)
+            album = resp.get(ALBUM)
+            if album:
+                album = album.copy()
+                album[ALBUM_TYPE] = str.lower(album.pop(TYPE, None) or "album")
+                resp[ALBUM] = album
+        elif cls is Artist and GENRES not in resp and GENRE in resp:
+            resp[GENRES] = resp.pop(GENRE)
+        elif cls is Album and resp.get(TYPE):
+            resp[ALBUM_TYPE] = str.lower(resp.pop(TYPE))
+        elif cls is Playlist and resp.get(ATTRIBUTES):
+            resp.update(resp.pop(ATTRIBUTES))
+        resp.update({URI: ":" + uri, TYPE: cls.type_attr})
+        return resp
+
+    @classmethod
     def fetch_metadata(cls, uri: str, args: list[str] = []) -> dict[str]:
         resp = {}
         if Zotify.CONFIG.permit_legacy_api() or (Zotify.CONFIG.permit_client_api() and not cls is Playlist):
             argstr = arg_comb(cls._fetch_args, *args)
             resp = Zotify.invoke_url(f'{cls._url}/{uri.split(":")[-1]}?{MARKET_APPEND}{argstr}')
         else:
-            resp = Zotify.invoke_libre_md(cls, uri)
-            if cls is Track and resp.get(DURATION):
-                resp[DURATION_MS] = resp.pop(DURATION)
-                if resp[ALBUM]:
-                    resp[ALBUM][ALBUM_TYPE] = str.lower(resp[ALBUM].pop(TYPE))
-            elif cls is Album and resp.get(TYPE):
-                resp[ALBUM_TYPE] = str.lower(resp.pop(TYPE))
-            elif cls is Playlist and resp.get(ATTRIBUTES):
-                resp.update(resp.pop(ATTRIBUTES))
-            resp.update({URI: ":" + uri, TYPE: cls.type_attr})
+            resp = cls._normalize_libre_metadata(uri, Zotify.invoke_libre_md(cls, uri))
         if resp: return resp
         else:    raise ValueError("No Metadata Fetched")
     
@@ -162,7 +189,27 @@ class Content(HierarchicalNode):
                                                     'RECOMMENDED TO SET CONFIG "API_CLIENT_LEGACY = False"')
             Zotify.LEGACY_API_ENDOINTS = False
         elif Zotify.ALLOW_LIBRE_BULK:
-            resps = Zotify.invoke_libre_bulk_md(ContClass, uris)
+            with Loader(f"Fetching bulk {loader_text} information (unsafe)...", disabled=hide_loader):
+                resps = Zotify.invoke_libre_bulk_md(ContClass, uris)
+            # Bulk responses are already fetched. Normalize them with the same adapter
+            # as single responses. A failed batch is reported once by the provider;
+            # do not turn it into one retrying request per item.
+            if resps is None:
+                resps = [None] * len(uris)
+            if resps is not None:
+                normalized = []
+                for i, uri in enumerate(uris):
+                    resp = resps[i] if i < len(resps) else None
+                    if resp is None:
+                        try:
+                            normalized.append(ContClass.fetch_metadata(uri))
+                        except Exception as error:
+                            Printer.hashtaged(PrintChannel.WARNING,
+                                              f'FAILED TO FETCH METADATA FOR {uri}: {error}')
+                            normalized.append(None)
+                    else:
+                        normalized.append(ContClass._normalize_libre_metadata(uri, resp))
+                return normalized
         
         suffix = "..." if Zotify.CONFIG.permit_client_api() else " (unsafe)..."
         with Loader(f"Fetching {loader_text} information{suffix}", disabled=hide_loader):
@@ -256,6 +303,12 @@ class Content(HierarchicalNode):
                     recurse_uris = [item.uri for item in recurs_children if isinstance(item, recurse_type)]
                     recurs_item_resps = self.fetch_uris_metadata(recurse_uris, recurse_type, hide_loader=True)
                     _ = self.parse_uris_metadata(recurs_item_resps, recurse_type, hide_loader=True)
+                for recurs_obj in recurs_objs:
+                    recurs_obj._needs_recursion = False
+            for obj in objs:
+                if isinstance(obj, Artist) and not obj._needs_expansion and not obj._needs_recursion:
+                    obj.discography_complete = True
+                    obj._hasMetadata = obj.full_metadata()
             return objs
     
     def check_skippable(self, parent_stack: ParentStack) -> bool:
@@ -305,8 +358,9 @@ class DLContent(Content):
             pass
         elif skip_wait:
             sleep(min(0.5, waittime))
-        elif waittime > 5:
-            Printer.hashtaged(PrintChannel.DOWNLOADS, f'PAUSED: WAITING FOR {waittime} SECONDS BETWEEN DOWNLOADS')
+        else:
+            if waittime >= 5:
+                Printer.hashtaged(PrintChannel.DOWNLOADS, f'PAUSED: WAITING FOR {waittime} SECONDS BETWEEN DOWNLOADS')
             sleep(waittime)
     
     # placeholder func, overwrite in each child class
@@ -330,10 +384,23 @@ class DLContent(Content):
     
     def check_skippable(self, parent_stack: ParentStack) -> bool:
         from zotify.metadata import SongArchive
+        # An interrupted tag write must be retried before archive/file skips.
+        if isinstance(self, Track):
+            context = parent_stack[0].context if parent_stack and isinstance(parent_stack[0], Query) else None
+            if context:
+                state = context.journal.get(self.uri)
+            else:
+                from zotify.download_journal import DownloadJournal
+                state = DownloadJournal(self._path_root).get(self.uri)
+            if state and state["state"] == "tags_pending":
+                return False
+
         def handle_archive(archived_path: PurePath):
             Printer.hashtaged(PrintChannel.SKIPPING, f'"{self}" ({self.clsn.upper()} DOWNLOADED PREVIOUSLY)\n'
                                                      f'FILE: "{self.rel_path(archived_path)}"')
             self.mark_downloaded(parent_stack, archived_path)
+            if parent_stack and isinstance(parent_stack[0], Query):
+                parent_stack[0]._run_skipped.add(self.uri)
         
         path = self.output_path(parent_stack)
         path_exists = Path(path).is_file() and Path(path).stat().st_size
@@ -374,10 +441,7 @@ class DLContent(Content):
         return False
     
     def fetch_stream(self):
-        stream_retry = 0
-        while not (stream := Zotify.get_content_stream(self)):
-            if stream_retry >= Zotify.CONFIG.get_retry_attempts(): break
-            stream_retry += 1; sleep(Zotify.CONFIG.get_retry_delay())
+        stream = Zotify.get_content_stream(self)
         if stream is None:
             Printer.hashtaged(PrintChannel.ERROR, f'SKIPPING {self.clsn.upper()} - FAILED TO GET CONTENT STREAM\n' +
                                                   f'{self.clsn}_ID: {self.id}')
@@ -385,14 +449,15 @@ class DLContent(Content):
     
     def fetch_stream_content(self, stream: Streamer, temppath: PurePath, parent_stack: ParentStack) -> str:
         disable = Zotify.CONFIG.get_standard_interface() or not Zotify.CONFIG.get_show_download_pbar()
-        pbar = Printer.pbar(desc=str(self), total=stream.size, unit='B', unit_scale=True,
+        expected_size = expected_stream_size(stream)
+        pbar = Printer.pbar(desc=str(self), total=expected_size, unit='B', unit_scale=True,
                             unit_divisor=1024, disable=disable, pbar_stack=parent_stack.PBARS)
         Path(temppath.parent).mkdir(parents=True, exist_ok=True)
         try:
             with open(temppath, 'wb') as file:
                 no_responses = 0
                 time_start = time()
-                t_per_byte = (self.duration_ms / 1000. / stream.size * Zotify.CONFIG.get_dl_rate_limter()) if self.duration_ms else 0
+                t_per_byte = (self.duration_ms / 1000. / expected_size * Zotify.CONFIG.get_dl_rate_limter()) if self.duration_ms and expected_size else 0
                 while no_responses < 5:
                     bytes_r = file.write(stream.stream().read(Zotify.CONFIG.get_chunk_size()))
                     if bytes_r:
@@ -401,6 +466,9 @@ class DLContent(Content):
                     else:
                         no_responses += 1
                         sleep(0.05)
+            received = Path(temppath).stat().st_size
+            if expected_size and received != expected_size:
+                raise IOError(f"Incomplete audio stream: received {received} of {expected_size} bytes")
                 # if Zotify.CONFIG.get_download_real_time():
                     #     elapsed_real = time() - time_start
                     #     elapsed_want = (pbar.n / stream.size) * (self.duration_ms/1000)
@@ -410,6 +478,61 @@ class DLContent(Content):
             pbar.close(); pbar.clear()
         
         return fmt_duration(time() - time_start)
+
+    def fetch_stream_with_recovery(self, temppath: PurePath, parent_stack: ParentStack) -> str | None:
+        """Retry a failed transfer from byte zero using a fresh stream and session."""
+        for attempt in range(Zotify.CONFIG.get_retry_attempts() + 1):
+            try:
+                stream = self.fetch_stream()
+                if stream is None:
+                    if attempt >= Zotify.CONFIG.get_retry_attempts():
+                        Printer.hashtaged(PrintChannel.ERROR,
+                                          f'SKIPPING {self.clsn.upper()} - FAILED TO GET CONTENT STREAM\n'
+                                          f'{self.clsn}_ID: {self.id}')
+                        return None
+                    if parent_stack and isinstance(parent_stack[0], Query):
+                        parent_stack[0].record_run_event(
+                            "transfer_retry", uri=self.uri, attempt=attempt + 1,
+                            reason="stream_unavailable")
+                    sleep(Zotify.CONFIG.get_retry_delay(attempt))
+                    continue
+                self.set_dl_status("Downloading Stream")
+                return self.fetch_stream_content(stream, temppath, parent_stack)
+            except KeyboardInterrupt:
+                try:
+                    Path(temppath).unlink(missing_ok=True)
+                except OSError:
+                    pass
+                if isinstance(self, Track):
+                    self._journal(parent_stack).set_state(
+                        self.uri, "failed", error="Interrupted by user")
+                if parent_stack and isinstance(parent_stack[0], Query):
+                    parent_stack[0].record_run_event("track_interrupted", uri=self.uri)
+                raise
+            except (ConnectionError, OSError, TimeoutError, requests.RequestException) as e:
+                if attempt >= Zotify.CONFIG.get_retry_attempts():
+                    Printer.hashtaged(PrintChannel.ERROR, f'FAILED TO FETCH OR READ STREAM AFTER {attempt + 1} ATTEMPTS\n'
+                                                          f'{self.clsn.upper()}_ID: {self.id}\nERROR: {e}')
+                    try: Path(temppath).unlink(missing_ok=True)
+                    except OSError: pass
+                    return None
+                Printer.hashtaged(PrintChannel.WARNING, f'STREAM CONNECTION FAILED; RECONNECTING AND RETRYING '
+                                                         f'({attempt + 1}/{Zotify.CONFIG.get_retry_attempts()})\n'
+                                                         f'{self.clsn.upper()}_ID: {self.id}\nERROR: {e}')
+                if parent_stack and isinstance(parent_stack[0], Query):
+                    parent_stack[0].record_run_event(
+                        "transfer_retry", uri=self.uri, attempt=attempt + 1,
+                        reason=type(e).__name__)
+                try:
+                    Zotify.renew_session()
+                except Exception as reconnect_error:
+                    Printer.logger(f'SESSION RECONNECT FAILED: {reconnect_error}', PrintChannel.ERROR)
+                    if parent_stack and isinstance(parent_stack[0], Query):
+                        parent_stack[0].record_run_event(
+                            "session_renewal_failed", uri=self.uri,
+                            error_type=type(reconnect_error).__name__)
+                    raise RuntimeError("Could not restore Spotify session; stopping this query") from reconnect_error
+                sleep(Zotify.CONFIG.get_retry_delay(attempt))
     
     @staticmethod
     def run_ffm(in_path: PurePath, in_cmd: list[str] | None, out_path: PurePath | None = None, out_cmd: list[str] | None = None) -> str:
@@ -674,10 +797,123 @@ class Track(DLContent, HasArtists, HasGenres, IsAddable, IsFavoritable):
         if self._ext == "mp3" and not Zotify.CONFIG.get_disc_track_totals() and self.disc_number and self.track_number:
             # music_tag python library writes DISCNUMBER and TRACKNUMBER as X/Y instead of X for mp3
             # this method bypasses all internal formatting, probably not resilient against arbitrary inputs
-            tags._write_tag_raw("mp3", "TPOS", str(self.disc_number))
-            tags._write_tag_raw("mp3", "TRCK", str(self.track_number))
+            tags._write_tag_raw("mp3", "TPOS", str(self.disc_number), False)
+            tags._write_tag_raw("mp3", "TRCK", str(self.track_number), False)
+
+    def _journal(self, parent_stack: ParentStack | None = None):
+        if parent_stack and parent_stack and isinstance(parent_stack[0], Query):
+            return parent_stack[0].context.journal
+        from zotify.download_journal import DownloadJournal
+        return DownloadJournal(self._path_root)
+
+    def _validate_audio(self, filepath: PurePath, expected_duration_ms: int | None = None,
+                        expected_size: int | None = None) -> bool:
+        """Require complete audio whose duration is close to the track metadata."""
+        if not file_has_content(filepath):
+            return False
+        try:
+            actual_size = Path(filepath).stat().st_size
+            if expected_size and actual_size != expected_size:
+                Printer.hashtaged(PrintChannel.ERROR,
+                                  f'INCOMPLETE STREAM: RECEIVED {actual_size} OF {expected_size} BYTES')
+                return False
+            actual_duration = self.get_audio_duration(filepath)
+            if actual_duration <= 0:
+                return False
+            if expected_duration_ms:
+                expected_duration = expected_duration_ms / 1000
+                tolerance = max(2.0, expected_duration * 0.02)
+                if abs(actual_duration - expected_duration) > tolerance:
+                    Printer.hashtaged(PrintChannel.ERROR,
+                                      f'AUDIO DURATION MISMATCH: EXPECTED {expected_duration:.2f}s, '
+                                      f'FOUND {actual_duration:.2f}s')
+                    return False
+            return True
+        except Exception as error:
+            Printer.hashtaged(PrintChannel.ERROR,
+                              f'FAILED TO VALIDATE STAGED AUDIO FOR TRACK {self.id}\n{error}')
+            return False
+
+    def _finish_pending_tags(self, parent_stack: ParentStack, state: dict) -> bool:
+        """Tag a copy of published audio, then atomically replace it."""
+        from pathlib import Path
+        final_path = Path(state["final_path"] or "")
+        if not file_has_content(final_path):
+            # A crash may have happened before audio publication: redownload.
+            return False
+        staged = final_path.with_name(
+            f".{final_path.stem}.{uuid4()}.zotify-stage{final_path.suffix}"
+        )
+        journal = self._journal(parent_stack)
+        journal.set_state(self.uri, "tags_pending", stage_path=staged,
+                          final_path=final_path)
+        attempts = journal.increment_tag_attempts(self.uri)
+        try:
+            shutil.copy2(final_path, staged)
+            self.write_audio_tags(staged)
+            if not self._validate_audio(staged):
+                raise ValueError("Tagged stage is empty or invalid audio")
+            os.replace(staged, final_path)
+        except Exception as error:
+            try:
+                staged.unlink(missing_ok=True)
+            except OSError:
+                pass
+            journal.set_state(self.uri, "tags_pending", final_path=final_path,
+                              error=str(error))
+            if attempts >= Zotify.CONFIG.get_retry_attempts() + 1:
+                journal.set_state(self.uri, "complete_untagged", final_path=final_path,
+                                  error=f"Tagging abandoned after {attempts} attempts: {error}")
+                self.mark_downloaded(parent_stack, final_path)
+                if parent_stack and isinstance(parent_stack[0], Query):
+                    parent_stack[0]._run_downloaded.add(self.uri)
+                Printer.hashtaged(PrintChannel.ERROR,
+                                  f'METADATA RETRIES EXHAUSTED FOR "{self}"; AUDIO KEPT WITHOUT TAGS')
+                return True
+            self.mark_downloaded(parent_stack, final_path)
+            if parent_stack and isinstance(parent_stack[0], Query):
+                parent_stack[0]._run_downloaded.add(self.uri)
+            Printer.hashtaged(PrintChannel.ERROR,
+                              f'FAILED TO WRITE METADATA FOR "{self}"; AUDIO KEPT FOR TAG RETRY')
+            Printer.traceback(error)
+            return True
+
+        journal.set_state(self.uri, "complete", final_path=final_path)
+        self.mark_downloaded(parent_stack, final_path)
+        if parent_stack and isinstance(parent_stack[0], Query):
+            parent_stack[0]._run_downloaded.add(self.uri)
+        return True
     
     def download(self, parent_stack: ParentStack) -> None:
+        journal = self._journal(parent_stack)
+        prior_state = journal.get(self.uri)
+        if prior_state and prior_state["state"] == "audio_verified":
+            staged = Path(prior_state["stage_path"]) if prior_state["stage_path"] else None
+            final = Path(prior_state["final_path"]) if prior_state["final_path"] else None
+            if staged and final and staged.is_file() and self._validate_audio(staged):
+                # Recover a crash after staging audio but before publication.
+                os.replace(staged, final)
+                journal.reset_tag_attempts(self.uri)
+                journal.set_state(self.uri, "tags_pending", final_path=final)
+                prior_state = journal.get(self.uri)
+            elif staged and final and not staged.exists() and file_has_content(final):
+                # Recover a crash after atomic audio publication but before the
+                # state transition to tags_pending.
+                journal.reset_tag_attempts(self.uri)
+                journal.set_state(self.uri, "tags_pending", final_path=final)
+                prior_state = journal.get(self.uri)
+            else:
+                if staged and staged.is_file():
+                    staged.unlink(missing_ok=True)
+                journal.set_state(self.uri, "failed", error="Interrupted before audio publication")
+                prior_state = journal.get(self.uri)
+        if prior_state and prior_state["state"] == "tags_pending":
+            # Retry only metadata; never request audio a second time.
+            if self._finish_pending_tags(parent_stack, prior_state):
+                if Zotify.CONFIG.get_optimized_dl() and journal.get(self.uri)["state"] == "complete":
+                    self.clone_to_all()
+                return
+
         if not Zotify.CONFIG.get_optimized_dl():
             if Zotify.CONFIG.get_download_parent_album():
                 with Zotify.CONFIG.temporary_config(DOWNLOAD_PARENT_ALBUM, False):
@@ -709,36 +945,58 @@ class Track(DLContent, HasArtists, HasGenres, IsAddable, IsFavoritable):
             if Zotify.CONFIG.get_temp_download_dir():
                 temppath = Zotify.CONFIG.get_temp_download_dir() / f'zotify_{str(uuid4())}_{self.id}.tmp'
         
-        if (stream := self.fetch_stream()) is None: return
-        self.set_dl_status("Downloading Stream")
-        time_elapsed_dl = self.fetch_stream_content(stream, temppath, parent_stack)
+        journal.set_state(self.uri, "downloading")
+        time_elapsed_dl = self.fetch_stream_with_recovery(temppath, parent_stack)
+        if time_elapsed_dl is None:
+            journal.set_state(self.uri, "failed", error="Failed to obtain or read content stream")
+            return
         
         if not Zotify.CONFIG.get_always_check_lyrics():
             self.fetch_lyrics(parent_stack)
         
         with self.set_dl_status("Converting File"):
             self.create_download_directory(path.parent)
-            time_elapsed_ffmpeg = self.convert_audio_format(temppath, path) # temppath -> path here
+            staged_path = path.with_name(
+                f".{path.stem}.{uuid4()}.zotify-stage{path.suffix}"
+            )
+            time_elapsed_ffmpeg = self.convert_audio_format(temppath, staged_path) # temppath -> staged
             if time_elapsed_ffmpeg is None:
-                path = pathlike_move_safe(temppath, path.with_suffix(".ogg"))
-            self.mark_downloaded(parent_stack, path)
-        
-        try: 
-            self.write_audio_tags(path)
-            if self.album: self.album.save_album_art_to_file(path, parent_stack)
-        except NotImplementedError as e:
-            if not "Mutagen type" in e.args[0]: raise
-            err_codec = e.args[0].removeprefix("Mutagen type ").removesuffix(" not implemented")
-            Printer.hashtaged(PrintChannel.ERROR,  'FAILED TO WRITE METADATA\n' +
-                                                  f'FILE "{self.rel_path(path)}" OF MEDIA TYPE {err_codec}\n' +
-                                                  f'INSTEAD OF EXPECTED MEDIA TYPE {self._codec}')
-        except Exception as e:
-            Printer.hashtaged(PrintChannel.ERROR, 'FAILED TO WRITE METADATA\n')
-            Printer.traceback(e)
+                path = path.with_suffix(".ogg")
+                staged_path = path.with_name(
+                    f".{path.stem}.{uuid4()}.zotify-stage{path.suffix}"
+                )
+                pathlike_move_safe(temppath, staged_path)
+
+        if not self._validate_audio(staged_path, self.duration_ms):
+            journal.set_state(self.uri, "failed", stage_path=staged_path,
+                              final_path=path, error="Audio validation failed")
+            staged_path.unlink(missing_ok=True)
+            Printer.hashtaged(PrintChannel.ERROR,
+                              f'FAILED TO VALIDATE DOWNLOAD FOR "{self}"; EXISTING FILE KEPT')
+            return
+
+        # Keep verified audio available even if metadata writing fails.
+        journal.set_state(self.uri, "audio_verified", stage_path=staged_path,
+                          final_path=path)
+        os.replace(staged_path, path)
+        journal.reset_tag_attempts(self.uri)
+        journal.set_state(self.uri, "tags_pending", final_path=path)
+        self.mark_downloaded(parent_stack, path)
+
+        if self.album:
+            self.album.save_album_art_to_file(path, parent_stack)
+        # Tag a copy so an interrupted mutagen write cannot damage audio.
+        if not self._finish_pending_tags(parent_stack, journal.get(self.uri)):
+            journal.set_state(self.uri, "failed", final_path=path,
+                              error="Published audio missing before tag retry")
+            return
         
         Interface.dl_complete(self, path, time_elapsed_dl, time_elapsed_ffmpeg)
+        if parent_stack and isinstance(parent_stack[0], Query):
+            parent_stack[0]._run_downloaded.add(self.uri)
         
-        if Zotify.CONFIG.get_optimized_dl(): self.clone_to_all()
+        if Zotify.CONFIG.get_optimized_dl() and journal.get(self.uri)["state"] == "complete":
+            self.clone_to_all()
         self.wait_between_downloads()
 
 
@@ -783,10 +1041,12 @@ class Episode(DLContent, IsAddable):
     def download_directly(self, path: PurePath) -> str:
         time_start = time()
         
-        r = requests.get(self.partner_url, stream=True, allow_redirects=True)
+        try:
+            r = requests.get(self.partner_url, stream=True, allow_redirects=True, timeout=HTTP_REQUEST_TIMEOUT)
+        except requests.exceptions.RequestException as error:
+            raise RuntimeError(f"Podcast download request failed ({type(error).__name__})") from None
         if r.status_code != 200:
-            r.raise_for_status()  # Will only raise for 4xx codes, so...
-            raise RuntimeError(f"Request to {self.partner_url} returned status code {r.status_code}")
+            raise RuntimeError(f"Podcast download request returned status code {r.status_code}")
         file_size = int(r.headers.get('Content-Length', 0))
         desc = "" if file_size else "(Unknown total file size)"
         
@@ -819,9 +1079,8 @@ class Episode(DLContent, IsAddable):
                 temppath = Zotify.CONFIG.get_temp_download_dir() / f'zotify_{str(uuid4())}_{self.id}.tmp'
         
         if not self.fetch_partner_url():
-            if (stream := self.fetch_stream()) is None: return
-            self.set_dl_status("Downloading Stream")
-            time_elapsed_dl = self.fetch_stream_content(stream, temppath, parent_stack)
+            time_elapsed_dl = self.fetch_stream_with_recovery(temppath, parent_stack)
+            if time_elapsed_dl is None: return
         else:
             try:
                 time_elapsed_dl = self.download_directly(temppath)
@@ -1046,7 +1305,7 @@ class Album(Container, HasArtists, IsFavoritable):
     def save_album_art_to_file(self, filepath: PurePath, parent_stack: ParentStack):
         if not Zotify.CONFIG.get_album_art_jpg_file() or self.image_url is None:
             return
-        image_bytes = requests.get(self.image_url).content # expect jpeg
+        image_bytes = fetch_artwork(self.image_url) # expect jpeg
         if not image_bytes:
             return
         album_path = filepath.with_name('cover.jpg');   a_exists = file_has_content(album_path)
@@ -1083,11 +1342,12 @@ class Artist(Container, HasGenres):
         self.end_year       : str               = None
         self.followers      : int               = None
         self.genres         : list[str]         = None
+        self.discography_complete: bool         = False
         self.singles        : list[Album]       = None
         self.start_year     : str               = None
     
     def full_metadata(self) -> bool:
-        return bool(self.genres)
+        return self.discography_complete
 
 
 class Show(Container):
@@ -1175,7 +1435,30 @@ class ParentStack(list):
         if self[-1] is None: 
             Printer.hashtaged(PrintChannel.WARNING, f'ATTEMPTING TO DOWNLOAD A STACK THAT FAILED TO FETCH METADATA')
             return
-        self[-1].download(self)
+        started = monotonic()
+        try:
+            self[-1].download(self)
+        except Exception as e:
+            if not isinstance(self[-1], DLContent):
+                raise
+            if isinstance(e, RuntimeError) and "Could not restore Spotify session" in str(e):
+                from zotify.download_journal import DownloadJournal
+                DownloadJournal(Zotify.CONFIG.get_root_path()).set_state(
+                    self[-1].uri, "failed", error=str(e))
+                raise
+            Printer.hashtaged(PrintChannel.ERROR, f'FAILED ITEM; CONTINUING WITH THE REST OF THE RUN\n'
+                                                  f'{self[-1].clsn.upper()}_ID: {self[-1].id}\nERROR: {e}')
+            Printer.traceback(e)
+            self[-1].wait_between_downloads()
+        finally:
+            if isinstance(self[-1], DLContent) and self and isinstance(self[0], Query):
+                state = None
+                if isinstance(self[-1], Track):
+                    state = self[0].context.journal.get(self[-1].uri)
+                self[0].record_run_event("track_attempt_finished", uri=self[-1].uri,
+                                         elapsed_seconds=monotonic() - started,
+                                         state=state.get("state") if state else
+                                               ("complete" if self[-1]._downloaded else "unknown"))
 
 
 class Query(Container):
@@ -1193,6 +1476,16 @@ class Query(Container):
         self.prefetched_map  : list[dict[int, Content]]                               = []
         self.requested_objs  : list[list[DLContent | Container | None]]               = []
         self._main_items     : list[DLContent | Container | None] | list[ParentStack] = []
+        self._run_downloaded: set[str] = set()
+        self._run_skipped: set[str] = set()
+        from zotify.download_journal import DownloadJournal
+        from zotify.run_context import RunContext
+        self.context = RunContext(self.id, Zotify.SESSION,
+                                  DownloadJournal(Zotify.CONFIG.get_root_path()),
+                                  Zotify.CONFIG.get_root_path())
+
+    def record_run_event(self, event: str, **fields) -> None:
+        self.context.record(event, **fields)
     
     @staticmethod
     def bulk_regex_urls(urls: str | list[str]) -> list[list[str]]:
@@ -1219,14 +1512,20 @@ class Query(Container):
         from zotify.metadata import MetadataIO
         MetadataIO.from_zmd()
         
-        def skip_fetch(uri: str) -> bool:
-            zmd_cont: Content | None = self.get_if_exists(uri)
-            return zmd_cont and zmd_cont._hasMetadata
-        
-        self.prefetched_map = [{i: self.get_if_exists(uri) for i, uri in enumerate(uris) if skip_fetch(uri)}
-                              for uris in self.parsed_request]
-        self.parsed_request = [[uri for uri in uris if uri not in prefet.values()]
-                              for uris, prefet in zip(self.parsed_request, self.prefetched_map)]
+        self.prefetched_map = []
+        uncached_uris = []
+        for uris in self.parsed_request:
+            prefetched = {}
+            remaining = []
+            for i, uri in enumerate(uris):
+                content: Content | None = self.get_if_exists(uri)
+                if content is not None and content._hasMetadata:
+                    prefetched[i] = content
+                else:
+                    remaining.append(uri)
+            self.prefetched_map.append(prefetched)
+            uncached_uris.append(remaining)
+        self.parsed_request = uncached_uris
     
     def fetch_query_metadata(self) -> list[list[dict]]:
         item_resps_by_type: list[list[dict]] = []
@@ -1241,16 +1540,28 @@ class Query(Container):
         return self.requested_objs
     
     def conditional_metadata(self):
-        alltracks = {t for t in self.ALL_NODES if isinstance(t, Track) and not t.is_local}
+        requested_items = (item for item_type_items in self.requested_objs for item in item_type_items)
+        alltracks: set[Track] = set()
+        for item in requested_items:
+            if isinstance(item, Track) and not item.is_local:
+                alltracks.add(item)
+            elif isinstance(item, Container):
+                alltracks.update(t for t in item.recurse_DLC() if isinstance(t, Track) and not t.is_local)
         
+        alltracks = {track for track in alltracks if not track._downloaded}
         artists: set[Artist] = set().union(*(set(track.artists) for track in alltracks if track.artists))
-        artist_uris: dict[str, Artist] = {a.uri: a for a in artists if not a.is_local and not a._hasMetadata
-                                          and not "".join(a.name.lower().split()) == "variousartists"}
+        artist_uris: dict[str, Artist] = {a.uri: a for a in artists if not a.is_local and a.genres is None
+                                          and not "".join((a.name or "").lower().split()) == "variousartists"}
         if Zotify.CONFIG.get_save_genres() and artist_uris:
             artist_resps = self.fetch_uris_metadata(artist_uris.keys(), Artist, loader_text=GENRE)
             for artist, artist_resp in zip(artist_uris.values(), artist_resps):
-                artist.parse_metadata(None, artist_resp)
-                artist._needs_expansion = False
+                if not artist_resp:
+                    continue
+                # Genre lookup must not parse artist discographies and create thousands
+                # of unrelated album and top-track objects in the query graph.
+                artist.genres = sorted(set(artist_resp.get(GENRES) or []))
+            self.export_zmd_snapshot()
+        if Zotify.CONFIG.get_save_genres():
             for track in alltracks:
                 genres: list[str] = [*set().union(*[set(artist.genres) for artist in track.artists if track.artists and artist.genres])]
                 genres.sort()
@@ -1268,14 +1579,45 @@ class Query(Container):
                 if album._needs_recursion:
                     track_resps = self.fetch_uris_metadata([t.uri for t in album.tracks], Track, loader_text=loader_text)
                     album.parse_uris_metadata(track_resps, Track, loader_text=loader_text)
+                self.export_zmd_snapshot()
         
-        if Zotify.CONFIG.get_export_zmd():
-            from zotify.metadata import MetadataIO
-            MetadataIO.to_zmd(self.id, self.ALL_NODES)
+        self.export_zmd_snapshot()
         
         if not self.prefetched_map: return
         self.requested_objs = [[prefet.get(i) or newfet.pop() for i in reversed(range(len(newfet)+len(prefet)))][::-1]
                               for newfet, prefet in zip(self.requested_objs, self.prefetched_map)] # efficient
+
+    def export_zmd_snapshot(self):
+        if Zotify.CONFIG.get_export_zmd():
+            from zotify.metadata import MetadataIO
+            MetadataIO.to_zmd(self.id, self.ALL_NODES)
+
+    def skip_existing_before_enrichment(self):
+        if Zotify.CONFIG.get_skip_by_isrc():
+            return
+        def visit(obj, parents):
+            if isinstance(obj, Track):
+                if not obj.is_local:
+                    obj.check_skippable(ParentStack([self, *parents, obj]))
+            elif isinstance(obj, Container):
+                for child in obj._main_items:
+                    visit(child, [*parents, obj])
+        for group in self.requested_objs:
+            for item in group:
+                visit(item, [])
+
+    def print_download_plan(self):
+        requested_tracks = {track for group in self.requested_objs for obj in group
+                            for track in ([obj] if isinstance(obj, Track) else
+                                          obj.recurse_DLC() if isinstance(obj, Container) else [])
+                            if isinstance(track, Track)}
+        remaining = [track for track in requested_tracks if track.uri not in self._run_skipped]
+        seconds = sum((track.duration_ms or 0) / 1000 * Zotify.CONFIG.get_dl_rate_limter()
+                      + Zotify.CONFIG.get_bulk_wait_time() for track in remaining)
+        Printer.hashtaged(PrintChannel.MANDATORY,
+                          f'DOWNLOAD PLAN: {len(requested_tracks)} tracks · '
+                          f'{len(self._run_skipped)} already present · {len(remaining)} to download · '
+                          f'about {fmt_duration(seconds)} at the selected pace')
     
     def create_m3u8_playlists(self) -> None:
         from zotify.metadata import M3U8
@@ -1318,7 +1660,7 @@ class Query(Container):
             
             if Zotify.CONFIG.get_download_parent_album():
                 tracks_with_albums: set[Track] = {t for t in dlc_mapping if isinstance(t, Track) and t.album}
-                for t in tracks_with_albums: dlc_mapping[dlc].append(ParentStack([self, t.album, t]))
+                for t in tracks_with_albums: dlc_mapping[t].append(ParentStack([self, t.album, t]))
             
             downloadables = set()
             for dlc, pss in dlc_mapping.items():
@@ -1329,11 +1671,11 @@ class Query(Container):
             
             downloadables = edge_zip(sorted(downloadables, key=lambda c: getattr(c[-1], DURATION_MS, 0)))
             if Zotify.CONFIG.get_download_parent_album():
-                downloadables = sorted(downloadables, key=lambda c: getattr(getattr(c, ALBUM, Album("")), URI))
+                downloadables = sorted(downloadables, key=lambda c: getattr(getattr(c[-1], ALBUM, None), URI, ""))
             self._main_items = downloadables
         
-        if Zotify.CONFIG.test_mode(): # TODO should test mode skip M3U8?
-            Printer.hashtaged(PrintChannel.MANDATORY, 'SKIPPING DOWNLOADS, PER TEST MODE')
+        if Zotify.CONFIG.test_mode():
+            Printer.hashtaged(PrintChannel.MANDATORY, 'DRY RUN: NO AUDIO WILL BE DOWNLOADED')
             return
         elif Zotify.CONFIG.get_standard_interface():
             Interface.ALL_DLCONTENT = {n for n in self.ALL_NODES if isinstance(n, DLContent)}
@@ -1354,9 +1696,11 @@ class Query(Container):
             Printer.back_up() # closing a visible pbar will print an extra newline
         
         if isinstance(interrupt, KeyboardInterrupt):
+            Zotify.RUN_EXIT_CODE = max(Zotify.RUN_EXIT_CODE, 1)
             Printer.hashtaged(PrintChannel.MANDATORY, 'USER CANCELED DOWNLOADS EARLY\n'+
                                                       'ATTEMPTING TO CLEAN UP')
         elif interrupt is not None:
+            Zotify.RUN_EXIT_CODE = 2
             Printer.hashtaged(PrintChannel.ERROR, 'UNEXPECTED ERROR DURING DOWNLOADS\n'+
                                                   'ATTEMPTING TO CLEAN UP')
             Printer.hashtaged(PrintChannel.ERROR, str(interrupt))
@@ -1364,6 +1708,8 @@ class Query(Container):
         if Zotify.CONFIG.get_export_m3u8() and self.requested_objs:
             with Loader("Creating m3u8 files..."):
                 self.create_m3u8_playlists()
+
+        self.write_run_summary()
         
         if interrupt is not None:
             Printer.hashtaged(PrintChannel.MANDATORY, 'CLEAN UP COMPLETE')
@@ -1372,12 +1718,82 @@ class Query(Container):
                 Printer.hashtaged(PrintChannel.ERROR, 'LOGGING ERROR AND TRACEBACK')
                 Printer.logger(self.__dict__, PrintChannel.ERROR)
                 raise interrupt.with_traceback(traceback)
+
+    def write_run_summary(self):
+        root = Path(Zotify.CONFIG.get_root_path())
+        journal = self.context.journal
+        pending, failed, untagged = [], [], []
+        requested_content = set()
+        def collect(content):
+            if isinstance(content, DLContent):
+                requested_content.add(content)
+            elif isinstance(content, Container):
+                for child in content._main_items:
+                    collect(child)
+        for group in self.requested_objs:
+            for content in group:
+                collect(content)
+        for content in requested_content:
+            state = journal.get(content.uri)
+            if not state:
+                continue
+            if content.uri in self._run_skipped and state["state"] == "failed":
+                continue
+            if state["state"] == "tags_pending":
+                pending.append(content.uri)
+            elif state["state"] == "failed":
+                failed.append(content.uri)
+            elif state["state"] == "complete_untagged":
+                untagged.append(content.uri)
+        failures = list(dict.fromkeys(failed + pending))
+        for content in sorted(requested_content, key=lambda item: item.uri):
+            state = journal.get(content.uri) or {}
+            final_state = ("skipped" if content.uri in self._run_skipped else
+                           "complete" if content.uri in self._run_downloaded else
+                           state.get("state", "not_downloaded"))
+            self.record_run_event("track_final", uri=content.uri, state=final_state)
+        if failures:
+            retry_path = root / f"zotify-failed-{self.id}.txt"
+            retry_path.write_text("\n".join(failures) + "\n", encoding="utf-8")
+        Printer.hashtaged(PrintChannel.MANDATORY,
+                          f'RUN SUMMARY: Downloaded {len(self._run_downloaded)} · '
+                          f'Skipped {len(self._run_skipped)} · Tags pending {len(pending)} · '
+                          f'Untagged {len(untagged)} · Failed {len(failed)}' +
+                          (f'\nRETRY LIST: {retry_path}' if failures else ''))
+        if failures or untagged:
+            Zotify.RUN_EXIT_CODE = max(Zotify.RUN_EXIT_CODE, 1)
+        self.record_run_event("run_summary", downloaded=len(self._run_downloaded),
+                              skipped=len(self._run_skipped), tags_pending=len(pending),
+                              untagged=len(untagged), failed=len(failed),
+                              exit_code=Zotify.RUN_EXIT_CODE)
     
+    @query_contextual
     def execute(self):
+        run_started = monotonic()
+        self.record_run_event("run_started")
+        metadata_started = monotonic()
         self.handle_zmd_prefetch()
         self.parse_query_metadata(self.fetch_query_metadata())
+        self.export_zmd_snapshot()
+        self.record_run_event("stage_finished", stage="query_metadata",
+                              elapsed_seconds=monotonic() - metadata_started)
+        skip_started = monotonic()
+        self.skip_existing_before_enrichment()
+        self.record_run_event("stage_finished", stage="existing_file_check",
+                              elapsed_seconds=monotonic() - skip_started)
+        self.print_download_plan()
+        if Zotify.CONFIG.test_mode():
+            self.download()
+            self.record_run_event("run_finished", elapsed_seconds=monotonic() - run_started,
+                                  dry_run=True)
+            return
+        enrichment_started = monotonic()
         self.conditional_metadata()
+        self.record_run_event("stage_finished", stage="optional_metadata",
+                              elapsed_seconds=monotonic() - enrichment_started)
         self.download()
+        self.record_run_event("run_finished", elapsed_seconds=monotonic() - run_started,
+                              dry_run=False)
 
 
 class VerifyLibrary(Query):
@@ -1448,6 +1864,7 @@ class VerifyLibrary(Query):
         for archive in all_archives:
             archive.update(self, TRACK)
     
+    @query_contextual
     def execute(self) -> None:
         # no zmd prefetch, meant to update entries
         all_archives, paths_per_track, track_resps = self.fetch_verifiable_metadata()
@@ -1483,6 +1900,7 @@ class UserItem(Query):
             selected_item_resps = user_item_resps[1:]
         return selected_item_resps
     
+    @query_contextual
     def execute(self):
         user_item_resps = self.fetch_user_items()
         if not user_item_resps: return

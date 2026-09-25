@@ -2,7 +2,11 @@ import json
 import logging
 import re
 import sys
+import threading
 import requests
+import webbrowser
+from contextvars import ContextVar
+from errno import EBADF, ECONNRESET, ENOTCONN, EPIPE, ETIMEDOUT
 from binascii import hexlify
 from base64 import b64encode, b64decode
 from contextlib import contextmanager
@@ -16,11 +20,12 @@ from librespot.proto.Authentication_pb2 import AuthenticationType
 from librespot.proto.Metadata_pb2 import AudioFile
 from pathlib import Path, PurePath
 from platform import system
-from time import sleep
+from time import sleep, monotonic
 from typing import Any, Callable
 
-from zotify.utils import ensure_is_file, file_has_content, safe_typecast, now
+from zotify.utils import ensure_is_file, file_has_content, safe_typecast, now, HTTP_REQUEST_TIMEOUT
 from zotify.termoutput import *
+from zotify.stream_utils import mark_stream_prefix_skipped
 
 Streamer = CdnManager.Streamer
 
@@ -53,6 +58,7 @@ CONFIG_VALUES = {
     OPTIMIZED_DOWNLOADING:      { DEFAULT: 'True',                    TYPE: bool,   ARG: ('--optimized-downloading'                   ,) },
     DOWNLOAD_RATE_LIMITER:      { DEFAULT: '0.0',                     TYPE: float,  ARG: ('-dlr', '--download-rate-limiter'           ,) },
     BULK_WAIT_TIME:             { DEFAULT: '1.0',                     TYPE: float,  ARG: ('--bulk-wait-time'                          ,) },
+    DOWNLOAD_PACE:               { DEFAULT: 'custom',                  TYPE: str,    ARG: ('--pace'                                    ,) },
     TEMP_DOWNLOAD_DIR:          { DEFAULT: '',                        TYPE: str,    ARG: ('-td', '--temp-download-dir'                ,) },
     
     # Album/Artist Options
@@ -338,10 +344,20 @@ class Config:
     
     @classmethod
     def get_dl_rate_limter(cls) -> float:
+        preset = str(cls.get(DOWNLOAD_PACE)).lower()
+        if preset in {"safe", "normal", "fast"}:
+            return {"safe": 0.75, "normal": 0.0, "fast": 0.0}[preset]
+        if preset != "custom":
+            raise ValueError(f'Unknown download pace "{preset}". Choose safe, normal, fast, or custom.')
         return cls.get(DOWNLOAD_RATE_LIMITER)
     
     @classmethod
     def get_bulk_wait_time(cls) -> float:
+        preset = str(cls.get(DOWNLOAD_PACE)).lower()
+        if preset in {"safe", "normal", "fast"}:
+            return {"safe": 30.0, "normal": 1.0, "fast": 0.0}[preset]
+        if preset != "custom":
+            raise ValueError(f'Unknown download pace "{preset}". Choose safe, normal, fast, or custom.')
         return cls.get(BULK_WAIT_TIME)
     
     @classmethod
@@ -700,7 +716,7 @@ class LogHandler:
         logfile = "zotify_" + ("DEBUG_" if Zotify.CONFIG.debug() else "") + f"{launch}.log"
         cls.LOG_PATH = Path(Zotify.CONFIG.get_root_path() / logfile)
         Printer.hashtaged(PrintChannel.DEBUG, f"{logfile} logging to {cls.LOG_PATH.resolve().parent}")
-        logging.basicConfig(level=logging.DEBUG if Zotify.CONFIG.debug() else logging.CRITICAL,
+        logging.basicConfig(level=logging.DEBUG if Zotify.CONFIG.debug() else logging.ERROR,
                             filemode="x", filename=cls.LOG_PATH)
         cls.LOGGER = logging.getLogger("zotify.debug")
         return cls.LOGGER
@@ -739,7 +755,12 @@ class LoginHandler:
     def create_oauth(client_id: str) -> OAuth:
         redirect_url = f"http://{Zotify.CONFIG.get_oauth_address()}:{Zotify.CONFIG.get_oauth_port()}/login"
         def oauth_print(url):
-            Printer.new_print(PrintChannel.MANDATORY, f"Click on the following link to login:\n{url}")
+            Printer.new_print(PrintChannel.MANDATORY,
+                              f"Opening the login page in your browser. If it doesn't open, open this link manually:\n{url}")
+            try:
+                webbrowser.open(url)
+            except Exception:
+                pass
         
         timeout = Zotify.CONFIG.get_oauth_timeout()
         return OAuth(client_id, redirect_url, oauth_print).set_scopes(SCOPES).set_listen_all(True).set_timeout(timeout)
@@ -845,9 +866,11 @@ class Zotify:
     # STATIC AFTER BOOT
     CONFIG                  : Config                    = Config
     SESSION                 : Session                   = None
+    SESSION_CREDENTIALS     : dict                      = None
     LOGGER                  : logging.Logger            = None
     DOWNLOAD_QUALITY        : FormatOnlyAudioQuality    = None
     DOWNLOAD_BITRATE        : str                       = None
+    _ORIGINAL_THREAD_EXCEP_HOOK                         = None
     
     # DYNAMIC PER SESSION
     FORCE_STREAM_API_CALLS  : bool                      = False
@@ -855,6 +878,26 @@ class Zotify:
     # DYNAMIC PER QUERY
     TOTAL_API_CALLS         : int                       = None
     DATETIME_LAUNCH         : str                       = None
+    RUN_EXIT_CODE           : int                       = 0
+    _RUN_CONTEXT = ContextVar("zotify_run_context", default=None)
+
+    @classmethod
+    def current_context(cls):
+        return cls._RUN_CONTEXT.get()
+
+    @classmethod
+    @contextmanager
+    def bind_run_context(cls, context):
+        token = cls._RUN_CONTEXT.set(context)
+        try:
+            yield
+        finally:
+            cls._RUN_CONTEXT.reset(token)
+
+    @classmethod
+    def current_session(cls):
+        context = cls.current_context()
+        return context.session if context is not None else cls.SESSION
     
     @classmethod
     def start_stats(cls) -> None:
@@ -887,10 +930,13 @@ class Zotify:
     
     @classmethod
     def boot(cls, args) -> None:
+        cls.RUN_EXIT_CODE = 0
+        cls._RUN_CONTEXT.set(None)
         Printer.splash()
         cls.start_stats()
         cls.CONFIG.load(args)
         cls.LOGGER = LogHandler.start_logger(cls.DATETIME_LAUNCH)
+        cls.install_thread_exception_hook()
         
         with Loader(LOGIN_STRING, PrintChannel.MANDATORY):
             cls.SESSION = LoginHandler.login(args)
@@ -899,7 +945,8 @@ class Zotify:
             Printer.hashtaged(PrintChannel.MANDATORY, 'ALL LOGIN ATTEMPTS UNSUCCESSFUL\n'+ 
                                                       'NO SESSION CREATED, EXITING PROGRAM')
             cls.end()
-            sys.exit(1) # TODO implement full exit code scheme
+            sys.exit(2)
+        cls.SESSION_CREDENTIALS = cls.SESSION.credentials()
         
         prem, quality, bitrate = cls.parse_dl_quality(cls.CONFIG.get_download_qual_pref())
         cls.DOWNLOAD_QUALITY = quality
@@ -908,6 +955,40 @@ class Zotify:
                       ('Custom Client API Initialized Successfully\n' if LoginHandler.OAUTH else '') +
                       f'User Subscription Type: {"PREMIUM" if prem else "FREE"}\n' +
                       f'Zotify Version v{cls.VERSION}')
+
+    @classmethod
+    def install_thread_exception_hook(cls) -> None:
+        """Show concise network failures from librespot's receiver thread."""
+        if cls._ORIGINAL_THREAD_EXCEP_HOOK is not None:
+            return
+
+        cls._ORIGINAL_THREAD_EXCEP_HOOK = threading.excepthook
+        original_hook = cls._ORIGINAL_THREAD_EXCEP_HOOK
+
+        def exception_hook(args) -> None:
+            error = args.exc_value
+            thread = args.thread
+            if (thread is None or thread.name != "session-packet-receiver"
+                    or not isinstance(error, OSError)):
+                original_hook(args)
+                return
+
+            def describe(exception: BaseException) -> str:
+                return getattr(exception, "strerror", None) or str(exception)
+
+            previous_error = error.__context__ or error.__cause__
+            if isinstance(previous_error, OSError):
+                message = (
+                    "Spotify lost its connection ({}) and reconnect failed ({}). "
+                    "If downloads stop progressing, rerun Zotify to resume."
+                ).format(describe(previous_error), describe(error))
+            else:
+                message = "Spotify's connection receiver stopped: {}.".format(
+                    describe(error))
+
+            Printer.traceback(error, message, PrintChannel.MANDATORY)
+
+        threading.excepthook = exception_hook
     
     @staticmethod
     def id_from_gid(gid: str) -> str:
@@ -943,10 +1024,21 @@ class Zotify:
         elif status_code in {500, 502}: return "Internal/Upstream Server Error"
         elif status_code == 503:        return "Service Unavailable (Possibly a Rate Limit)"
         else:                           return ""
+
+    @staticmethod
+    def is_session_transport_error(error: Exception) -> bool:
+        if isinstance(error, OSError) and error.errno in {EBADF, ECONNRESET, ENOTCONN, EPIPE, ETIMEDOUT}:
+            return True
+        message = str(error).lower()
+        return any(token in message for token in (
+            "session is closed", "session isn't authenticated", "connection reset",
+            "spotify session reconnected during audio-key request", "eof",
+        ))
     
     @classmethod
     def invoke_libre_md(cls, ContClass: type, uri: str) -> dict[str, str | int | dict]:
         api_retry = 0
+        session_recovered = False
         while api_retry <= cls.CONFIG.get_retry_attempts():
             if api_retry:
                 Printer.hashtaged(PrintChannel.WARNING, f'API ERROR {retry_text}- RETRYING\n' +
@@ -957,9 +1049,9 @@ class Zotify:
             try:
                 content_id = cls.to_libre_content(ContClass, uri.split(":")[-1])
                 if ContClass.clsn == "Playlist":
-                    proto = cls.SESSION.api().get_playlist(content_id)
+                    proto = cls.current_session().api().get_playlist(content_id)
                 else:
-                    proto = getattr(cls.SESSION.api(), f"get_metadata_4_{ContClass.type_attr}")(content_id)
+                    proto = getattr(cls.current_session().api(), f"get_metadata_4_{ContClass.type_attr}")(content_id)
                 resp = MessageToDict(proto, preserving_proto_field_name=True)
                 if resp.get(GID): resp[GID] = proto.gid # use gid in bytes
                 break
@@ -967,8 +1059,14 @@ class Zotify:
                 fallback_message = f'Status {e.code}:   \n{cls.api_status_str(e.code)}'
             except ConnectionError as e:
                 fallback_message = e.args[0]
+                if not session_recovered and cls.is_session_transport_error(e):
+                    cls.renew_session()
+                    session_recovered = True
             except Exception as e:
                 fallback_message = f'UNKNOWN OR UNEXPECTED ERROR: {e}'
+                if not session_recovered and cls.is_session_transport_error(e):
+                    cls.renew_session()
+                    session_recovered = True
             finally: cls.TOTAL_API_CALLS += 1
             retry_text = f"(RETRY {api_retry}) " if api_retry else ""
             retry_delay = cls.CONFIG.get_retry_delay(api_retry)
@@ -983,38 +1081,69 @@ class Zotify:
     
     @classmethod
     def invoke_libre_bulk_md(cls, ContClass: type, uris: list[str]) -> list[dict[str, str | int | dict] | None]:
-        api_retry = 0
-        while api_retry <= cls.CONFIG.get_retry_attempts():
-            if api_retry:
-                Printer.hashtaged(PrintChannel.WARNING, f'API ERROR {retry_text}- RETRYING\n' +
-                                                        f'FAILED TO FETCH METADATA FOR {ContClass.uppers}'+
-                                                        f'{fallback_message}')
-                sleep(retry_delay)
-            
-            try:
-                content_ids = [cls.to_libre_content(ContClass, uri.split(":")[-1]) for uri in uris]
-                protos = cls.SESSION.api().get_metadata_4_multiple(content_ids)
-                resps = [MessageToDict(proto, preserving_proto_field_name=True) if proto else None for proto in protos]
-                for proto, resp in zip(protos, resps):
-                    if resp.get(GID): resp[GID] = proto.gid # use gid in bytes
-                break
-            except ApiClient.StatusCodeException as e:
-                fallback_message = f'Status {e.code}:   \n{cls.api_status_str(e.code)}'
-            except ConnectionError as e:
-                fallback_message = e.args[0]
-            except Exception as e:
-                fallback_message = f'UNKNOWN OR UNEXPECTED ERROR: {e}'
-            finally: cls.TOTAL_API_CALLS += 1
-            retry_text = f"(RETRY {api_retry}) " if api_retry else ""
-            retry_delay = cls.CONFIG.get_retry_delay(api_retry)
-            api_retry += 1
-        
-        sleep(cls.CONFIG.get_fetch_delay())
-        if api_retry <= cls.CONFIG.get_retry_attempts():
-            return resp
-        Printer.hashtaged(PrintChannel.API_ERROR, f'RETRY LIMIT EXCEDED\n' +
-                                                    f'FAILED TO FETCH METADATA FOR {ContClass.uppers}')
-        return {}
+        def fetch_batch(batch: list[str]) -> list[dict | None]:
+            api_retry = 0
+            session_recovered = False
+            while api_retry <= cls.CONFIG.get_retry_attempts():
+                if api_retry:
+                    Printer.hashtaged(PrintChannel.WARNING, f'API ERROR (RETRY {api_retry}) - RETRYING\n' +
+                                                            f'FAILED TO FETCH METADATA FOR {ContClass.uppers}\n' +
+                                                            fallback_message)
+                    sleep(cls.CONFIG.get_retry_delay(api_retry - 1))
+                try:
+                    content_ids = [cls.to_libre_content(ContClass, uri.split(":")[-1]) for uri in batch]
+                    protos = cls.current_session().api().get_metadata_4_multiple(content_ids)
+                    resps = [MessageToDict(proto, preserving_proto_field_name=True) if proto else None
+                             for proto in protos]
+                    for proto, resp in zip(protos, resps):
+                        if proto and resp and resp.get(GID): resp[GID] = proto.gid
+                    break
+                except ApiClient.StatusCodeException as e:
+                    fallback_message = f'Status {e.code}:   \n{cls.api_status_str(e.code)}'
+                    if e.code == 413:
+                        if len(batch) == 1:
+                            # The batch wrapper can be too large even for one item;
+                            # Let the caller retry only this missing item through
+                            # the single-item endpoint, preserving input positions.
+                            return [None]
+                        midpoint = len(batch) // 2
+                        return fetch_batch(batch[:midpoint]) + fetch_batch(batch[midpoint:])
+                except ConnectionError as e:
+                    fallback_message = str(e)
+                    if not session_recovered and cls.is_session_transport_error(e):
+                        cls.renew_session()
+                        session_recovered = True
+                except Exception as e:
+                    fallback_message = f'UNKNOWN OR UNEXPECTED ERROR: {e}'
+                    if not session_recovered and cls.is_session_transport_error(e):
+                        cls.renew_session()
+                        session_recovered = True
+                finally:
+                    cls.TOTAL_API_CALLS += 1
+                retry_delay = cls.CONFIG.get_retry_delay(api_retry)
+                api_retry += 1
+
+            sleep(cls.CONFIG.get_fetch_delay())
+            if api_retry <= cls.CONFIG.get_retry_attempts():
+                # A partial batch can omit an unavailable or malformed item. Retry
+                # only those positions through the single-item endpoint.
+                resps = (resps + [None] * len(batch))[:len(batch)]
+                for i, resp in enumerate(resps):
+                    if not resp:
+                        resps[i] = cls.invoke_libre_md(ContClass, batch[i]) or None
+                return resps
+            Printer.hashtaged(PrintChannel.API_ERROR, f'RETRY LIMIT EXCEEDED\n' +
+                                                      f'FAILED TO FETCH METADATA FOR {ContClass.uppers}')
+            return [None] * len(batch)
+
+        # Keep payloads comfortably below the size that caused 413 responses.
+        # Split further on a 413, preserving the original URI order.
+        batch_size = 50
+        results = []
+        for offset in range(0, len(uris), batch_size):
+            batch_result = fetch_batch(uris[offset:offset + batch_size])
+            results.extend(batch_result)
+        return results
     
     @classmethod
     def invoke_url(cls, url: str, params: dict | None = None, expectFail: bool = False, force_login5: bool = False) -> dict[str, str | int | dict]:
@@ -1033,9 +1162,10 @@ class Zotify:
                                                         f'Status {http.status_code}:  '+
                                                         f'{resp.get(ERROR, {}).get(MESSAGE, "No message provided")}')
             if api_retry: sleep(retry_delay if not expectFail else 1)
+            request_started = monotonic()
             
             try:
-                http = requests.get(url, headers=headers, params=params)
+                http = requests.get(url, headers=headers, params=params, timeout=HTTP_REQUEST_TIMEOUT)
                 fallback_message = cls.api_status_str(http.status_code, http)
                 resp: dict[str, str | int | dict] = http.json()
                 http.raise_for_status()
@@ -1051,7 +1181,16 @@ class Zotify:
                     return {} # do not count as fetch, skip FETCH_DELAY
                 elif not resp:              resp = {ERROR: {MESSAGE: "Received an empty response"}}
                 elif not resp.get(ERROR):   resp = {ERROR: {MESSAGE: fallback_message}}
-            finally: cls.TOTAL_API_CALLS += 1
+            except requests.exceptions.RequestException as e:
+                http = requests.Response()
+                http.status_code = 0
+                fallback_message = f"Request failed ({type(e).__name__})"
+                resp = {ERROR: {MESSAGE: fallback_message}}
+            finally:
+                cls.TOTAL_API_CALLS += 1
+                logging.getLogger("zotify.debug").debug(
+                    "Metadata HTTP attempt completed: status=%s elapsed=%.3fs",
+                    http.status_code, monotonic() - request_started)
             retry_text = f"(RETRY {api_retry}) " if api_retry else ""
             retry_delay = max(cls.CONFIG.get_retry_delay(api_retry), float(http.headers.get(RETRY_AFTER, 0.0)))
             api_retry += 1
@@ -1065,8 +1204,7 @@ class Zotify:
                                                     f'{fallback_message}')
         elif not expectFail:
             Printer.hashtaged(PrintChannel.API_ERROR, f'RETRY LIMIT EXCEDED\n' +
-                                                      f'RESPONSE TEXT: {Printer.pretty(resp)}\n' +
-                                                      f'URL: {Printer.pretty(url)}')
+                                                      f'RESPONSE TEXT: {Printer.pretty(resp)}')
         return {}
     
     @classmethod
@@ -1111,25 +1249,66 @@ class Zotify:
         return items
     
     @classmethod
-    def get_content_stream(cls, content, use_qual_pref: bool = True) -> Streamer | None:
+    def renew_session(cls) -> None:
+        old_session = cls.current_session()
+        credentials = cls.SESSION_CREDENTIALS or old_session.credentials()
+        builder = Session.Builder()
+        builder.conf.store_credentials = False
+        encoded = b64encode(json.dumps(credentials, ensure_ascii=True).encode("ascii"))
+        new_session = builder.stored(encoded).create()
+        new_credentials = new_session.credentials()
+        cls.SESSION = new_session
+        context = cls.current_context()
+        if context is not None:
+            context.replace_session(new_session)
+        cls.SESSION_CREDENTIALS = new_credentials
+        LoginHandler.SESSION = new_session
+        cls.FORCE_STREAM_API_CALLS = False
+        try:
+            old_session.close()
+        except Exception:
+            pass  # The old socket may already be closed.
+
+    @classmethod
+    def retry_after_session_loss(cls, content, use_qual_pref: bool,
+                                 recover_session: bool, error: Exception) -> Streamer | None:
+        if not recover_session:
+            raise RuntimeError("Spotify session is still disconnected after reconnection") from error
+        Printer.hashtaged(PrintChannel.WARNING, 'SPOTIFY SESSION DISCONNECTED - RECONNECTING')
+        sleep(cls.CONFIG.get_retry_delay())
+        try:
+            cls.renew_session()
+        except Exception as reconnect_error:
+            context = cls.current_context()
+            if context is not None:
+                context.record("session_renewal_failed",
+                               error_type=type(reconnect_error).__name__)
+            raise RuntimeError("Could not restore Spotify session; rerun Zotify to resume") from reconnect_error
+        return None
+
+    @classmethod
+    def get_content_stream(cls, content, use_qual_pref: bool = True,
+                           recover_session: bool = True) -> Streamer | None:
         content_id = cls.to_libre_content(content.__class__, content.id)
         if not content_id: return
         qual = cls.DOWNLOAD_QUALITY if use_qual_pref else cls.parse_dl_quality()[1]
         Printer.logger(f'Fetching stream for {content.type_attr}:{content.id} at quality {qual.preferred.name}')
+        session = cls.current_session()
         try:
             if not content.file_ids or cls.FORCE_STREAM_API_CALLS:
                 risky_method = False
-                lds = cls.SESSION.content_feeder().load(content_id, qual, False, None)
+                lds = session.content_feeder().load(content_id, qual, False, None)
                 return lds.input_stream if lds else None
             risky_method = True
             if getattr(content, EXTERNAL_URL, None):
-                url = cls.SESSION.client().head(content.external_url).url
-                return cls.SESSION.cdn().stream_external_episode(content, url, None)
+                url = session.client().head(content.external_url).url
+                return session.cdn().stream_external_episode(content, url, None)
             file = qual.get_file([ParseDict(f, AudioFile()) for f in content.file_ids])
-            key = cls.SESSION.audio_key().get_audio_key(content.gid, file.file_id)
-            url = cls.SESSION.content_feeder().resolve_storage_interactive(file.file_id, False)
-            streamer = cls.SESSION.cdn().stream_file(file, key, CdnFeedHelper.get_url(url), None)
+            key = session.audio_key().get_audio_key(content.gid, file.file_id)
+            url = session.content_feeder().resolve_storage_interactive(file.file_id, False)
+            streamer = session.cdn().stream_file(file, key, CdnFeedHelper.get_url(url), None)
             if streamer.stream().skip(0xA7) != 0xA7: raise IOError("Couldn't skip 0xa7 bytes!")
+            mark_stream_prefix_skipped(streamer, 0xA7)
             return streamer
         except FeederException as e:
             if not use_qual_pref:
@@ -1139,30 +1318,36 @@ class Zotify:
             preference = cls.DOWNLOAD_QUALITY.preferred.name
             Printer.hashtaged(PrintChannel.WARNING, 'FAILED TO FETCH AUDIO FILE\n' +
                                                    f'PREFERED AUDIO QUALITY {preference} NOT AVAILABLE - FALLING BACK TO AUTO')
-            return cls.get_content_stream(content, use_qual_pref=False)
+            return cls.get_content_stream(content, use_qual_pref=False, recover_session=recover_session)
         except RuntimeError as e:
             error_arg = e.args[0]
-            if isinstance(error_arg, str) and 'Failed fetching audio key!' in error_arg:
+            if isinstance(error_arg, str) and error_arg in {"Session is closed!", "Session isn't authenticated!"}:
+                return cls.retry_after_session_loss(content, use_qual_pref, recover_session, e)
+            elif isinstance(error_arg, str) and 'Failed fetching audio key!' in error_arg:
                 gid, fileid = error_arg.split('! ')[1].split(', ')
                 Printer.hashtaged(PrintChannel.ERROR, 'FAILED TO FETCH AUDIO KEY\n' +
                                                   'MAY BE CAUSED BY RATE LIMITS - CONSIDER INCREASING `BULK_WAIT_TIME`\n' +
                                                  f'GID: {gid[5:]} - File_ID: {fileid[8:]}')
-                Printer.logger("\n".join(e.args), PrintChannel.ERROR)
+                Printer.logger("\n".join(str(arg) for arg in e.args), PrintChannel.ERROR)
             elif isinstance(error_arg, int):
                 Printer.hashtaged(PrintChannel.ERROR, 'FAILED TO FETCH AUDIO KEY\n' +
                                                      f'(ASSUMED HTTP) RUNTIME ERROR - STATUS CODE {error_arg}')
-                Printer.logger("\n".join(e.args), PrintChannel.ERROR)
+                Printer.logger("\n".join(str(arg) for arg in e.args), PrintChannel.ERROR)
             else: raise
         except ConnectionError as e:
+            if isinstance(e, OSError) and e.errno in {EBADF, ECONNRESET, ENOTCONN, EPIPE, ETIMEDOUT}:
+                return cls.retry_after_session_loss(content, use_qual_pref, recover_session, e)
             if "Status code " not in e.args[0]: raise
             status_code = e.args[0].split("Status code ")[1]
             Printer.hashtaged(PrintChannel.ERROR, 'FAILED TO FETCH AUDIO FILE\n' +
                                                  f'CONNECTION ERROR WHEN FETCHING CONTENT STREAM - STATUS CODE {status_code}')
-            Printer.logger("\n".join(e.args), PrintChannel.ERROR)
+            Printer.logger("\n".join(str(arg) for arg in e.args), PrintChannel.ERROR)
         except Exception as e:
+            if isinstance(e, OSError) and e.errno in {EBADF, ECONNRESET, ENOTCONN, EPIPE, ETIMEDOUT}:
+                return cls.retry_after_session_loss(content, use_qual_pref, recover_session, e)
             if risky_method:
                 cls.FORCE_STREAM_API_CALLS = True
-                return cls.get_content_stream(content, use_qual_pref=use_qual_pref)
+                return cls.get_content_stream(content, use_qual_pref=use_qual_pref, recover_session=recover_session)
             Printer.hashtaged(PrintChannel.ERROR, 'FAILED TO FETCH AUDIO STREAM\n' +
                                                   'AN UNEXPECTED ERROR OCCURED - CHECK LOGS FOR DETAILS')
             Printer.traceback(e)
@@ -1171,7 +1356,7 @@ class Zotify:
     @classmethod
     def get_user_profile(cls, username: str) -> dict:
         try:
-            return cls.SESSION.api().get_user_profile(username)
+            return cls.current_session().api().get_user_profile(username)
         except Exception as e:
             Printer.debug(f"Failed to fetch user profile for {username}")
             Printer.traceback(e)
