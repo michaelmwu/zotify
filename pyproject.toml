@@ -23,7 +23,7 @@ classifiers = [
   "Operating System :: OS Independent"
 ]
 dependencies = [
-  "librespot @ git+https://github.com/Googolplexed0/librespot-python.git",
+  "librespot @ git+https://github.com/michaelmwu/librespot-python.git@e0e4681ef9c287c5a00f31d7aa195517b1a385db",
   "ffmpy",
   "music_tag",
   "Pillow",
@@ -39,3 +39,4 @@ zotify = "zotify.__main__:main"
 
 [tool.uv]
 config-settings = { editable_mode = "compat" }
+exclude-newer = "7 days"
