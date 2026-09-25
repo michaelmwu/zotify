@@ -226,7 +226,7 @@ wheels = [
 [[package]]
 name = "librespot"
 version = "0.0.15"
-source = { git = "https://github.com/michaelmwu/librespot-python.git?rev=b77aca9ca714e7de21782f969a55cd80210210ad#b77aca9ca714e7de21782f969a55cd80210210ad" }
+source = { git = "https://github.com/michaelmwu/librespot-python.git?rev=125e5337232a8bb38781cbe9d73ce552e08919f8#125e5337232a8bb38781cbe9d73ce552e08919f8" }
 dependencies = [
     { name = "defusedxml" },
     { name = "protobuf" },
@@ -590,7 +590,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "ffmpy" },
-    { name = "librespot", git = "https://github.com/michaelmwu/librespot-python.git?rev=b77aca9ca714e7de21782f969a55cd80210210ad" },
+    { name = "librespot", git = "https://github.com/michaelmwu/librespot-python.git?rev=125e5337232a8bb38781cbe9d73ce552e08919f8" },
     { name = "music-tag" },
     { name = "pillow" },
     { name = "pkce" },
