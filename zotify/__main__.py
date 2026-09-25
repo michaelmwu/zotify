@@ -137,6 +137,7 @@ def main():
     
     from zotify.app import client
     client(args, modes)
+    return Zotify.RUN_EXIT_CODE
 
 
 if __name__ == '__main__':

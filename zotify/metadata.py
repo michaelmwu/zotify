@@ -1,4 +1,6 @@
 import json
+import os
+import tempfile
 from base64 import b64encode, b64decode
 from music_tag import AudioFile, load_file
 from music_tag.file import TAG_MAP_ENTRY, MetadataItem
@@ -405,8 +407,19 @@ class MetadataIO:
         zmd[ZMD_ENTRIES].update(entries)
         cls.PARSING = None
         
-        with open(zmd_path, "w") as f:
-            json.dump(zmd, f, indent=4)
+        fd, temp_name = tempfile.mkstemp(prefix=f".{zmd_path.name}.", suffix=".tmp",
+                                         dir=zmd_path.parent)
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(zmd, f, indent=4)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temp_name, zmd_path)
+        finally:
+            try:
+                os.unlink(temp_name)
+            except FileNotFoundError:
+                pass
 
 
 class Tagger:
