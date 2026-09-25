@@ -40,19 +40,25 @@ def doctor(args: Namespace) -> int:
         credential_path = Config._default_path()
     if credential_path.suffix.lower() != ".json":
         credential_path = credential_path / "credentials.json"
-    checks.append(("credentials.json", str(credential_path) if credential_path.is_file()
-                   and credential_path.stat().st_size else None))
+    saved_credentials = None
+    try:
+        if credential_path.is_file() and credential_path.stat().st_size:
+            parsed_credentials = json.loads(credential_path.read_text(encoding="utf-8"))
+            if isinstance(parsed_credentials, dict) and isinstance(parsed_credentials.get("type"), str):
+                saved_credentials = parsed_credentials
+    except (OSError, json.JSONDecodeError):
+        pass
+    checks.append(("readable credentials.json", str(credential_path) if saved_credentials else None))
 
     if getattr(args, "doctor_session", False):
         session_status = None
         session_error_type = None
-        if credential_path.is_file() and credential_path.stat().st_size:
+        if saved_credentials:
             try:
                 from librespot.core import Session
-                credentials = json.loads(credential_path.read_text(encoding="utf-8"))
                 builder = Session.Builder()
                 builder.conf.store_credentials = False
-                encoded = b64encode(json.dumps(credentials, ensure_ascii=True).encode("ascii"))
+                encoded = b64encode(json.dumps(saved_credentials, ensure_ascii=True).encode("ascii"))
                 session = builder.stored(encoded).create()
                 session_status = "created successfully from saved credentials"
                 try:
