@@ -9,5 +9,11 @@ def mark_stream_prefix_skipped(stream, byte_count: int) -> None:
 
 
 def expected_stream_size(stream) -> int:
-    """Return the bytes still available to download from a stream."""
+    """Return bytes remaining in the underlying stream, including implicit skips."""
+    try:
+        available = stream.stream().available()
+    except (AttributeError, TypeError):
+        available = None
+    if isinstance(available, int) and available >= 0:
+        return available
     return getattr(stream, "_zotify_expected_size", stream.size)
