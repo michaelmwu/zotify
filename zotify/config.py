@@ -877,6 +877,12 @@ class Zotify:
     TOTAL_API_CALLS         : int                       = None
     DATETIME_LAUNCH         : str                       = None
     RUN_EXIT_CODE           : int                       = 0
+    RUN_CONTEXT                                         = None
+
+    @classmethod
+    def current_session(cls):
+        context = cls.RUN_CONTEXT
+        return context.session if context is not None else cls.SESSION
     
     @classmethod
     def start_stats(cls) -> None:
@@ -910,6 +916,7 @@ class Zotify:
     @classmethod
     def boot(cls, args) -> None:
         cls.RUN_EXIT_CODE = 0
+        cls.RUN_CONTEXT = None
         Printer.splash()
         cls.start_stats()
         cls.CONFIG.load(args)
@@ -1027,9 +1034,9 @@ class Zotify:
             try:
                 content_id = cls.to_libre_content(ContClass, uri.split(":")[-1])
                 if ContClass.clsn == "Playlist":
-                    proto = cls.SESSION.api().get_playlist(content_id)
+                    proto = cls.current_session().api().get_playlist(content_id)
                 else:
-                    proto = getattr(cls.SESSION.api(), f"get_metadata_4_{ContClass.type_attr}")(content_id)
+                    proto = getattr(cls.current_session().api(), f"get_metadata_4_{ContClass.type_attr}")(content_id)
                 resp = MessageToDict(proto, preserving_proto_field_name=True)
                 if resp.get(GID): resp[GID] = proto.gid # use gid in bytes
                 break
@@ -1070,7 +1077,7 @@ class Zotify:
                     sleep(cls.CONFIG.get_retry_delay(api_retry - 1))
                 try:
                     content_ids = [cls.to_libre_content(ContClass, uri.split(":")[-1]) for uri in batch]
-                    protos = cls.SESSION.api().get_metadata_4_multiple(content_ids)
+                    protos = cls.current_session().api().get_metadata_4_multiple(content_ids)
                     resps = [MessageToDict(proto, preserving_proto_field_name=True) if proto else None
                              for proto in protos]
                     for proto, resp in zip(protos, resps):
@@ -1228,7 +1235,7 @@ class Zotify:
     
     @classmethod
     def renew_session(cls) -> None:
-        old_session = cls.SESSION
+        old_session = cls.current_session()
         credentials = cls.SESSION_CREDENTIALS or old_session.credentials()
         builder = Session.Builder()
         builder.conf.store_credentials = False
@@ -1236,6 +1243,8 @@ class Zotify:
         new_session = builder.stored(encoded).create()
         new_credentials = new_session.credentials()
         cls.SESSION = new_session
+        if cls.RUN_CONTEXT is not None:
+            cls.RUN_CONTEXT.replace_session(new_session)
         cls.SESSION_CREDENTIALS = new_credentials
         LoginHandler.SESSION = new_session
         cls.FORCE_STREAM_API_CALLS = False
@@ -1254,6 +1263,9 @@ class Zotify:
         try:
             cls.renew_session()
         except Exception as reconnect_error:
+            if cls.RUN_CONTEXT is not None:
+                cls.RUN_CONTEXT.record("session_renewal_failed",
+                                       error_type=type(reconnect_error).__name__)
             raise RuntimeError("Could not restore Spotify session; rerun Zotify to resume") from reconnect_error
         return None
 
@@ -1264,19 +1276,20 @@ class Zotify:
         if not content_id: return
         qual = cls.DOWNLOAD_QUALITY if use_qual_pref else cls.parse_dl_quality()[1]
         Printer.logger(f'Fetching stream for {content.type_attr}:{content.id} at quality {qual.preferred.name}')
+        session = cls.current_session()
         try:
             if not content.file_ids or cls.FORCE_STREAM_API_CALLS:
                 risky_method = False
-                lds = cls.SESSION.content_feeder().load(content_id, qual, False, None)
+                lds = session.content_feeder().load(content_id, qual, False, None)
                 return lds.input_stream if lds else None
             risky_method = True
             if getattr(content, EXTERNAL_URL, None):
-                url = cls.SESSION.client().head(content.external_url).url
-                return cls.SESSION.cdn().stream_external_episode(content, url, None)
+                url = session.client().head(content.external_url).url
+                return session.cdn().stream_external_episode(content, url, None)
             file = qual.get_file([ParseDict(f, AudioFile()) for f in content.file_ids])
-            key = cls.SESSION.audio_key().get_audio_key(content.gid, file.file_id)
-            url = cls.SESSION.content_feeder().resolve_storage_interactive(file.file_id, False)
-            streamer = cls.SESSION.cdn().stream_file(file, key, CdnFeedHelper.get_url(url), None)
+            key = session.audio_key().get_audio_key(content.gid, file.file_id)
+            url = session.content_feeder().resolve_storage_interactive(file.file_id, False)
+            streamer = session.cdn().stream_file(file, key, CdnFeedHelper.get_url(url), None)
             if streamer.stream().skip(0xA7) != 0xA7: raise IOError("Couldn't skip 0xa7 bytes!")
             return streamer
         except FeederException as e:
@@ -1325,7 +1338,7 @@ class Zotify:
     @classmethod
     def get_user_profile(cls, username: str) -> dict:
         try:
-            return cls.SESSION.api().get_user_profile(username)
+            return cls.current_session().api().get_user_profile(username)
         except Exception as e:
             Printer.debug(f"Failed to fetch user profile for {username}")
             Printer.traceback(e)
