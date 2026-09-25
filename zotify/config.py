@@ -944,7 +944,7 @@ class Zotify:
             Printer.hashtaged(PrintChannel.MANDATORY, 'ALL LOGIN ATTEMPTS UNSUCCESSFUL\n'+ 
                                                       'NO SESSION CREATED, EXITING PROGRAM')
             cls.end()
-            sys.exit(1) # TODO implement full exit code scheme
+            sys.exit(2)
         cls.SESSION_CREDENTIALS = cls.SESSION.credentials()
         
         prem, quality, bitrate = cls.parse_dl_quality(cls.CONFIG.get_download_qual_pref())

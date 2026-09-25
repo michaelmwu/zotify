@@ -166,9 +166,11 @@ def perform_query(args: Namespace) -> None:
             search_and_select()
     
     except KeyboardInterrupt:
+        Zotify.RUN_EXIT_CODE = max(Zotify.RUN_EXIT_CODE, 1)
         Printer.hashtaged(PrintChannel.MANDATORY, "ABORTING QUERY")
         return
     except Exception as e:
+        Zotify.RUN_EXIT_CODE = 2
         Printer.traceback(
             e,
             f"Zotify stopped: {type(e).__name__}: {e}",

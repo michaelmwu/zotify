@@ -1694,9 +1694,11 @@ class Query(Container):
             Printer.back_up() # closing a visible pbar will print an extra newline
         
         if isinstance(interrupt, KeyboardInterrupt):
+            Zotify.RUN_EXIT_CODE = max(Zotify.RUN_EXIT_CODE, 1)
             Printer.hashtaged(PrintChannel.MANDATORY, 'USER CANCELED DOWNLOADS EARLY\n'+
                                                       'ATTEMPTING TO CLEAN UP')
         elif interrupt is not None:
+            Zotify.RUN_EXIT_CODE = 2
             Printer.hashtaged(PrintChannel.ERROR, 'UNEXPECTED ERROR DURING DOWNLOADS\n'+
                                                   'ATTEMPTING TO CLEAN UP')
             Printer.hashtaged(PrintChannel.ERROR, str(interrupt))
@@ -1757,7 +1759,7 @@ class Query(Container):
                           f'Untagged {len(untagged)} · Failed {len(failed)}' +
                           (f'\nRETRY LIST: {retry_path}' if failures else ''))
         if failures or untagged:
-            Zotify.RUN_EXIT_CODE = 1
+            Zotify.RUN_EXIT_CODE = max(Zotify.RUN_EXIT_CODE, 1)
         self.record_run_event("run_summary", downloaded=len(self._run_downloaded),
                               skipped=len(self._run_skipped), tags_pending=len(pending),
                               untagged=len(untagged), failed=len(failed),
