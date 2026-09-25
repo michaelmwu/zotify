@@ -1,0 +1,28 @@
+"""Offline regression tests for payload sizes after stream framing is skipped."""
+import unittest
+
+from zotify.stream_utils import expected_stream_size, mark_stream_prefix_skipped
+
+
+class FakeStream:
+    def __init__(self, size):
+        self.size = size
+
+
+class StreamSizeTests(unittest.TestCase):
+    def test_unmodified_stream_uses_its_full_size(self):
+        stream = FakeStream(1000)
+        self.assertEqual(expected_stream_size(stream), 1000)
+
+    def test_skipped_spotify_header_is_not_counted_as_payload(self):
+        stream = FakeStream(5_995_405)
+        mark_stream_prefix_skipped(stream, 0xA7)
+        self.assertEqual(expected_stream_size(stream), 5_995_238)
+
+    def test_prefix_larger_than_stream_is_rejected(self):
+        with self.assertRaises(ValueError):
+            mark_stream_prefix_skipped(FakeStream(10), 0xA7)
+
+
+if __name__ == "__main__":
+    unittest.main()
