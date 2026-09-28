@@ -470,10 +470,6 @@ class DLContent(Content):
             received = Path(temppath).stat().st_size
             if expected_size and received != expected_size:
                 raise IOError(f"Incomplete audio stream: received {received} of {expected_size} bytes")
-                # if Zotify.CONFIG.get_download_real_time():
-                    #     elapsed_real = time() - time_start
-                    #     elapsed_want = (pbar.n / stream.size) * (self.duration_ms/1000)
-                    # if elapsed_want > elapsed_real:
         finally:
             pbar.close(); pbar.clear()
         
@@ -1576,7 +1572,7 @@ class Query(Container):
                 alltracks.add(item)
             elif isinstance(item, Container):
                 alltracks.update(t for t in item.recurse_DLC() if isinstance(t, Track) and not t.is_local)
-        
+
         alltracks = {track for track in alltracks if not track._downloaded}
         artists: set[Artist] = {
             artist for track in alltracks for artist in (track.artists or []) if artist is not None
@@ -1598,7 +1594,7 @@ class Query(Container):
                     genre for artist in (track.artists or []) if artist and artist.genres
                     for genre in artist.genres
                 })
-        
+
         albums = {track.album for track in alltracks if track.album and not track.album.is_local}
         album_uris: dict[str, Album] = {a.uri: a for a in albums if not a._hasMetadata}
         if (Zotify.CONFIG.get_disc_track_totals() or Zotify.CONFIG.get_download_parent_album()) and albums:
@@ -1797,7 +1793,7 @@ class Query(Container):
                               skipped=len(self._run_skipped), tags_pending=len(pending),
                               untagged=len(untagged), failed=len(failed),
                               exit_code=Zotify.RUN_EXIT_CODE)
-    
+
     @query_contextual
     def execute(self):
         run_started = monotonic()
