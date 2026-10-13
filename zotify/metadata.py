@@ -590,6 +590,7 @@ class SongArchive:
         self._entries: list[dict[str, str | PurePath]] | None = None
         self._lookup_index: tuple[dict[str, list[tuple[int, dict[str, str | PurePath]]]],
                                   dict[str, list[tuple[int, dict[str, str | PurePath]]]]] | None = None
+        if file_has_content(self.path) is None: self.disabled = True
     
     def _obj_to_entry(self, obj: DLContent, item_path: PurePath, timestamp: str = None) -> dict[str, str | PurePath]:
         entry = self.ARCHIVE_FORMAT.copy()
