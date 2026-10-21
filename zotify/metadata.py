@@ -566,6 +566,10 @@ class Tagger:
 
 class SongArchive:
     UPDATE_GLOBAL: bool = Zotify.CONFIG.get_update_archive()
+    # Archive objects are created for each track, but a playlist usually checks
+    # the same archive thousands of times. Share the parsed lookup until the
+    # archive changes, while still checking that each referenced audio file exists.
+    _shared_lookup_indexes: dict[PurePath, tuple[tuple[int, int, int] | None, tuple[dict, dict]]] = {}
     ITEM_ID = "item_id"
     DL_TIMESTAMP = "dl_timestamp"
     AUTHOR_NAME = "author_name"
@@ -588,8 +592,6 @@ class SongArchive:
         self.mode = 'a' if file_has_content(self.path) else 'w' # should always exist from Content.create_download_directory()
         self.disabled = Zotify.CONFIG.get_no_song_archive() if self._global else Zotify.CONFIG.get_no_dir_archives()
         self._entries: list[dict[str, str | PurePath]] | None = None
-        self._lookup_index: tuple[dict[str, list[tuple[int, dict[str, str | PurePath]]]],
-                                  dict[str, list[tuple[int, dict[str, str | PurePath]]]]] | None = None
     
     def _obj_to_entry(self, obj: DLContent, item_path: PurePath, timestamp: str = None) -> dict[str, str | PurePath]:
         entry = self.ARCHIVE_FORMAT.copy()
@@ -614,7 +616,7 @@ class SongArchive:
         self._add_entries(self.mode, [self._obj_to_entry(obj, item_path)])
         self.mode = 'a'
         self._entries = None
-        self._lookup_index = None
+        self._shared_lookup_indexes.pop(self.path, None)
     
     def update(self, query: Query, item_prefix: str) -> None:
         entries = [self._parse_entry_str(entry_str) for entry_str in self._read_entry_strs()]
@@ -624,7 +626,7 @@ class SongArchive:
             entry.update(self._obj_to_entry(obj, entry[self.ITEM_PATH], entry[self.DL_TIMESTAMP]))
         self._add_entries('w', entries)
         self._entries = None
-        self._lookup_index = None
+        self._shared_lookup_indexes.pop(self.path, None)
     
     def _parse_entry_str(self, entry_str: str) -> dict[str, str | PurePath]:
         entry = self.ARCHIVE_FORMAT.copy()
@@ -672,16 +674,33 @@ class SongArchive:
             self._entries = [self._parse_entry_str(entry_str) for entry_str in self._read_entry_strs()]
         return self._entries
 
+    def _archive_version(self) -> tuple[int, int, int] | None:
+        try:
+            stat = Path(self.path).stat()
+        except OSError:
+            return None
+        return stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size
+
     def _get_lookup_index(self):
-        if self._lookup_index is None:
-            ids: dict[str, list[tuple[int, dict[str, str | PurePath]]]] = {}
-            isrcs: dict[str, list[tuple[int, dict[str, str | PurePath]]]] = {}
-            for index, entry in enumerate(self._get_entries()):
-                ids.setdefault(str(entry[self.ITEM_ID]), []).append((index, entry))
-                if entry[self.ISRC_CODE]:
-                    isrcs.setdefault(str(entry[self.ISRC_CODE]), []).append((index, entry))
-            self._lookup_index = ids, isrcs
-        return self._lookup_index
+        if self.disabled:
+            return {}, {}
+        version = self._archive_version()
+        cached = self._shared_lookup_indexes.get(self.path)
+        if cached is not None and cached[0] == version:
+            return cached[1]
+
+        # A caller may reuse this instance after another process edits the file.
+        self._entries = None
+        ids: dict[str, list[tuple[int, dict[str, str | PurePath]]]] = {}
+        isrcs: dict[str, list[tuple[int, dict[str, str | PurePath]]]] = {}
+        for index, entry in enumerate(self._get_entries()):
+            ids.setdefault(str(entry[self.ITEM_ID]), []).append((index, entry))
+            if entry[self.ISRC_CODE]:
+                isrcs.setdefault(str(entry[self.ISRC_CODE]), []).append((index, entry))
+        index = ids, isrcs
+        # Reading can upgrade a legacy archive, so capture its version afterward.
+        self._shared_lookup_indexes[self.path] = self._archive_version(), index
+        return index
 
     def _entry_path(self, entry: dict[str, str | PurePath]) -> PurePath | None:
         path = entry[self.ITEM_PATH]

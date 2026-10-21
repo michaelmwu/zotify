@@ -1493,6 +1493,7 @@ class Query(Container):
     
     def __init__(self, timestamp: str):
         HierarchicalNode.ALL_NODES = {}
+        ParentStack.SKIPPABLE_CACHE = {}
         ParentStack.PBARS = []
         super().__init__(f"{self.type_attr}:{timestamp}" )
         del self.name
@@ -1626,7 +1627,11 @@ class Query(Container):
         def visit(obj, parents):
             if isinstance(obj, Track):
                 if not obj.is_local:
-                    obj.check_skippable(ParentStack([self, *parents, obj]))
+                    stack = ParentStack([self, *parents, obj])
+                    if obj.check_skippable(stack):
+                        # The download planner checks the same stack again. The
+                        # first pass already recorded its path and skip reason.
+                        stack.SKIPPABLE_CACHE[hash(stack)] = True
             elif isinstance(obj, Container):
                 for child in obj._main_items:
                     visit(child, [*parents, obj])
